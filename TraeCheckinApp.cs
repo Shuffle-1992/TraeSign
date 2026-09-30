@@ -215,7 +215,59 @@ namespace TraeSign
             if (old != null) { old.Dispose(); }
         }
 
-        // 聚合托盘状态：任一平台失败/无登录态→红；全部就绪（已签/无活动）→绿；否则灰
+        // 单平台信号灯：绿=已完成（已签到/已领取/无活动）、红=需处理（未找到登录态/失败/待授权）、灰=进行中
+        public static readonly Color LightGreen = Color.FromArgb(76, 175, 80);
+        public static readonly Color LightRed = Color.FromArgb(244, 67, 54);
+        public static readonly Color LightGray = Color.FromArgb(158, 158, 158);
+
+        public static void GetSlotLight(PlatformSlot s, out Color color, out string state)
+        {
+            color = LightGray;
+            state = "待查询";
+            if (s == null) return;
+            if (s.Accounts.Count == 0)
+            {
+                color = LightRed;
+                state = s.Platform == "WorkBuddy" ? "待授权" : "未找到登录态";
+                return;
+            }
+            if (s.Busy)
+            {
+                state = s.Platform == "ZCode" ? "检查中" : "签到中";
+                return;
+            }
+            var r = s.LastResult;
+            if (r != null && (r.Success || r.CheckedIn))
+            {
+                color = LightGreen;
+                state = s.Platform == "ZCode" ? "已领取" : "已签到";
+                return;
+            }
+            if (r != null && r.Already)
+            {
+                color = LightGreen;
+                state = s.Platform == "ZCode" ? "无活动" : "已签到";
+                return;
+            }
+            if (r != null && r.HasClaimable)
+            {
+                state = "发现可领套餐";
+                return;
+            }
+            if (r != null && r.Code == -1 && s.Platform == "WorkBuddy")
+            {
+                color = LightRed;
+                state = "待授权";
+                return;
+            }
+            if (r != null)
+            {
+                color = LightRed;
+                state = s.Platform == "ZCode" ? "检查异常" : "未签到";
+            }
+        }
+
+        // 聚合托盘状态：任一平台红灯→红；全部绿灯→绿；否则灰
         public TrayState ComputeAggregateState(out string tip)
         {
             bool allOk = true;
@@ -223,49 +275,12 @@ namespace TraeSign
             var parts = new List<string>();
             foreach (var s in _slots)
             {
+                Color c;
                 string state;
-                if (s.Accounts.Count == 0)
-                {
-                    state = "未找到登录态";
-                    anyFail = true;
-                    allOk = false;
-                }
-                else if (s.Busy)
-                {
-                    state = s.Platform == "ZCode" ? "检查中" : "签到中";
-                    allOk = false;
-                }
-                else if (s.LastResult != null && (s.LastResult.Success || s.LastResult.CheckedIn))
-                {
-                    state = s.Platform == "ZCode" ? "已领取" : "已签到";
-                }
-                else if (s.LastResult != null && s.LastResult.Already)
-                {
-                    // 已签到 / ZCode 无可领套餐：均为"今日无事可做"的正常态
-                    state = s.Platform == "ZCode" ? "无活动" : "已签到";
-                }
-                else if (s.LastResult != null && s.LastResult.HasClaimable)
-                {
-                    state = "有可领套餐";   // 机会态：不算异常，也不算完成
-                    allOk = false;
-                }
-                else if (s.LastResult != null && s.LastResult.Code == -1 && s.Platform == "WorkBuddy")
-                {
-                    state = "待授权";   // WorkBuddy 未授权属待设置状态，不算异常
-                    allOk = false;
-                }
-                else if (s.LastResult != null)
-                {
-                    state = s.Platform == "ZCode" ? "检查异常" : "未签到";
-                    anyFail = true;
-                    allOk = false;
-                }
-                else
-                {
-                    state = "待查询";
-                    allOk = false;
-                }
+                GetSlotLight(s, out c, out state);
                 parts.Add(s.Platform + ":" + state);
+                if (c == LightRed) anyFail = true;
+                if (c != LightGreen) allOk = false;
             }
             tip = "TraeSign - " + string.Join(" | ", parts.ToArray());
             if (anyFail) return TrayState.Failed;
@@ -2850,6 +2865,21 @@ namespace TraeSign
         {
             var slot = _app.Slot(Platform);
             if (slot == null) return;
+            // 自愈兜底：列表为空但本机凭证实际存在（装载竞态残留）→ 实时重读并回填
+            if (slot.Accounts.Count == 0 && (Platform == "ZCode" || Platform == "Trae"))
+            {
+                try
+                {
+                    List<AccountInfo> live = Platform == "ZCode" ? ZcodeAuth.ListAccounts() : CheckinRunner.ListAccounts();
+                    if (live.Count > 0)
+                    {
+                        slot.Accounts = live;
+                        slot.ActiveBrand = live[0].Brand;
+                        _app.RunCheckinAsync(true, Platform, null);
+                    }
+                }
+                catch { }
+            }
             string active = slot.ActiveBrand;
             AccountInfo acc = slot.ActiveAccount();
             bool isZc = (Platform == "ZCode");
@@ -2859,7 +2889,7 @@ namespace TraeSign
             if (acc == null)
             {
                 _accountDetailLabel.Text = isZc
-                    ? "未找到 ZCode 登录态，请先登录 ZCode 客户端或 CLI"
+                    ? "未找到 ZCode 登录态；请确认已登录 ZCode 客户端/CLI，或点“刷新状态”重试"
                     : (Platform == "WorkBuddy"
                         ? "未找到 WorkBuddy 客户端登录态；可点击“登录授权”直接授权本程序"
                         : "未找到登录态，请先运行 Trae 桌面端登录");
@@ -3030,9 +3060,11 @@ namespace TraeSign
             titlePanel.Controls.Add(titleLabel);
             titlePanel.Controls.Add(_titleStatus);
 
-            // ---- 三平台 Tab ----
+            // ---- 三平台 Tab（自绘：页签带红绿灯状态点） ----
             _tabs = new TabControl();
             _tabs.Dock = DockStyle.Fill;
+            _tabs.DrawMode = TabDrawMode.OwnerDrawFixed;
+            _tabs.DrawItem += OnTabDrawItem;
 
             var tpTrae = new TabPage("Trae");
             _traePanel = new PlatformPanel(app, "Trae");
@@ -3050,8 +3082,43 @@ namespace TraeSign
             _tabs.TabPages.Add(tpWb);
             _tabs.TabPages.Add(tpZc);
 
+            // OwnerDrawFixed 的页签尺寸须在页签加入后设置才生效
+            _tabs.SizeMode = TabSizeMode.Fixed;
+            _tabs.ItemSize = new Size(118, 30);
+
             Controls.Add(_tabs);
             Controls.Add(titlePanel);
+        }
+
+        // 页签自绘：状态灯（绿/红/灰）+ 平台名
+        private void OnTabDrawItem(object sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= _tabs.TabPages.Count) return;
+            var slot = _app.Slot(_tabs.TabPages[e.Index].Text);
+            Color c;
+            string state;
+            TrayApp.GetSlotLight(slot, out c, out state);
+            bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+
+            using (var b = new SolidBrush(selected ? Color.White : SystemColors.Control))
+                e.Graphics.FillRectangle(b, e.Bounds);
+            if (selected)
+                using (var p = new Pen(TrayApp.LightGreen, 2f))
+                    e.Graphics.DrawLine(p, e.Bounds.X + 2, e.Bounds.Bottom - 2, e.Bounds.Right - 2, e.Bounds.Bottom - 2);
+
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var b = new SolidBrush(c))
+                e.Graphics.FillEllipse(b, e.Bounds.X + 13, e.Bounds.Y + e.Bounds.Height / 2 - 5, 10, 10);
+
+            string text = _tabs.TabPages[e.Index].Text;
+            using (var f = new Font(this.Font, selected ? FontStyle.Bold : FontStyle.Regular))
+                TextRenderer.DrawText(e.Graphics, text, f,
+                    new Rectangle(e.Bounds.X + 28, e.Bounds.Y, e.Bounds.Width - 30, e.Bounds.Height),
+                    selected ? Color.FromArgb(30, 30, 30) : Color.FromArgb(90, 90, 90),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+
+            // 悬停提示带具体状态
+            _tabs.TabPages[e.Index].ToolTipText = state;
         }
 
         public void RefreshAccounts()
@@ -3083,6 +3150,8 @@ namespace TraeSign
             _titleStatus.Tag = tip;
             _traePanel.RefreshView();
             _wbPanel.RefreshView();
+            _zcPanel.RefreshView();
+            _tabs.Invalidate();   // 状态灯重绘
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)

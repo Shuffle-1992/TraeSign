@@ -3,3 +3,6 @@
 
 # 踩坑记录（不公开）
 pitfalls.md
+
+# ZCode 会话工作目录（本地）
+.zcode/

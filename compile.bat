@@ -13,6 +13,7 @@ taskkill /IM TraeSign.exe /F >nul 2>&1
   /reference:System.Web.Extensions.dll ^
   /reference:System.Security.dll ^
   /win32manifest:app.manifest ^
+  /win32icon:app.ico ^
   TraeCheckinApp.cs CalendarControl.cs
 
 if errorlevel 1 (

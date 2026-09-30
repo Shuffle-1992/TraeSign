@@ -91,7 +91,7 @@ namespace TraeSign
         }
     }
 
-    // ============ 托盘应用上下文（双平台） ============
+    // ============ 托盘应用上下文（三平台） ============
     internal class TrayApp : ApplicationContext
     {
         private NotifyIcon _tray;
@@ -101,6 +101,12 @@ namespace TraeSign
         private readonly List<PlatformSlot> _slots = new List<PlatformSlot>();
         private PlatformSlot _trae;
         private PlatformSlot _wb;
+        private PlatformSlot _zc;
+
+        // ZCode 活动套餐轮询（区别于每日签到：套餐随机投放，周期检查、发现即领）
+        private System.Windows.Forms.Timer _zcodeTimer;
+        private DateTime _zcodeNextCheckAt;
+        internal const int ZcodePollMinutes = 10;
 
         public TrayApp()
         {
@@ -111,8 +117,11 @@ namespace TraeSign
             _trae.Platform = "Trae";
             _wb = new PlatformSlot();
             _wb.Platform = "WorkBuddy";
+            _zc = new PlatformSlot();
+            _zc.Platform = "ZCode";   // 活动套餐模型，无每日调度器
             _slots.Add(_trae);
             _slots.Add(_wb);
+            _slots.Add(_zc);
 
             _tray = new NotifyIcon();
             _tray.Visible = true;
@@ -121,10 +130,11 @@ namespace TraeSign
             _tray.DoubleClick += delegate { ShowMainWindow(); };
 
             var menu = new ContextMenuStrip();
-            menu.Items.Add("立即签到（两平台）", null, delegate
+            menu.Items.Add("立即签到（全部平台）", null, delegate
             {
                 RunCheckinAsync(false, "Trae", null);
                 RunCheckinAsync(false, "WorkBuddy", null);
+                RunCheckinAsync(false, "ZCode", null);
             });
             menu.Items.Add("打开主窗口", null, delegate { ShowMainWindow(); });
             menu.Items.Add(new ToolStripSeparator());
@@ -133,12 +143,45 @@ namespace TraeSign
 
             foreach (var s in _slots)
             {
+                if (s.Platform == "ZCode") continue;
                 s.Scheduler = new DailyScheduler(this, s.Platform);
                 s.Scheduler.Start();
             }
+            StartZcodePoller();
 
-            // 加载两平台账号列表（后台），完成后刷新状态
+            // 加载三平台账号列表（后台），完成后刷新状态
             LoadAccountsAsync();
+        }
+
+        // ZCode 轮询器：启动后 15 秒首查（避开启动批量查询高峰），此后每 10 分钟
+        private void StartZcodePoller()
+        {
+            _zcodeNextCheckAt = DateTime.Now.AddSeconds(15);
+            _zcodeTimer = new System.Windows.Forms.Timer();
+            _zcodeTimer.Interval = 30000;
+            _zcodeTimer.Tick += delegate
+            {
+                if (DateTime.Now < _zcodeNextCheckAt) return;
+                _zcodeNextCheckAt = DateTime.Now.AddMinutes(ZcodePollMinutes);
+                var slot = Slot("ZCode");
+                if (slot == null || slot.Busy) return;
+                RunCheckinAsync(true, "ZCode", null);
+            };
+            _zcodeTimer.Start();
+        }
+
+        // 按 ZCode 结果差异化安排下次检查时间
+        private void ScheduleZcodeNext(CheckinResult r)
+        {
+            if (r == null) return;
+            if (r.Code == 1005 && r.RetryAfterAt > 0)
+                _zcodeNextCheckAt = DateTimeOffset.FromUnixTimeSeconds(r.RetryAfterAt).LocalDateTime.AddMinutes(1);
+            else if (r.Code == 1005)
+                _zcodeNextCheckAt = DateTime.Now.AddMinutes(30);
+            else if (!r.Success && !r.Already && r.Code != 0 && r.Code != 1003)
+                _zcodeNextCheckAt = DateTime.Now.AddMinutes(5);
+            else
+                _zcodeNextCheckAt = DateTime.Now.AddMinutes(ZcodePollMinutes);
         }
 
         public NotifyIcon Tray { get { return _tray; } }
@@ -172,7 +215,7 @@ namespace TraeSign
             if (old != null) { old.Dispose(); }
         }
 
-        // 聚合托盘状态：任一平台失败/无登录态→红；全部已签到→绿；否则灰
+        // 聚合托盘状态：任一平台失败/无登录态→红；全部就绪（已签/无活动）→绿；否则灰
         public TrayState ComputeAggregateState(out string tip)
         {
             bool allOk = true;
@@ -189,12 +232,22 @@ namespace TraeSign
                 }
                 else if (s.Busy)
                 {
-                    state = "签到中";
+                    state = s.Platform == "ZCode" ? "检查中" : "签到中";
                     allOk = false;
                 }
                 else if (s.LastResult != null && (s.LastResult.Success || s.LastResult.CheckedIn))
                 {
-                    state = "已签到";
+                    state = s.Platform == "ZCode" ? "已领取" : "已签到";
+                }
+                else if (s.LastResult != null && s.LastResult.Already)
+                {
+                    // 已签到 / ZCode 无可领套餐：均为"今日无事可做"的正常态
+                    state = s.Platform == "ZCode" ? "无活动" : "已签到";
+                }
+                else if (s.LastResult != null && s.LastResult.HasClaimable)
+                {
+                    state = "有可领套餐";   // 机会态：不算异常，也不算完成
+                    allOk = false;
                 }
                 else if (s.LastResult != null && s.LastResult.Code == -1 && s.Platform == "WorkBuddy")
                 {
@@ -203,7 +256,7 @@ namespace TraeSign
                 }
                 else if (s.LastResult != null)
                 {
-                    state = "未签到";
+                    state = s.Platform == "ZCode" ? "检查异常" : "未签到";
                     anyFail = true;
                     allOk = false;
                 }
@@ -232,7 +285,7 @@ namespace TraeSign
             if (_form != null && !_form.IsDisposed) _form.RefreshView();
         }
 
-        // 后台加载两平台账号列表
+        // 后台加载三平台账号列表
         public void LoadAccountsAsync()
         {
             Task.Run(delegate { return LoadBothLists(); })
@@ -241,7 +294,7 @@ namespace TraeSign
                     TwoLists both;
                     try { both = t.Result; }
                     catch { both = null; }
-                    if (both != null) OnAccountsLoaded(both.Trae, both.Wb);
+                    if (both != null) OnAccountsLoaded(both.Trae, both.Wb, both.Zc);
                 }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
@@ -250,16 +303,17 @@ namespace TraeSign
             var r = new TwoLists();
             r.Trae = CheckinRunner.ListAccounts();
             r.Wb = WorkbuddyAuth.ListAccounts();
+            r.Zc = ZcodeAuth.ListAccounts();
             return r;
         }
 
-        // 手动刷新：重新拉取两平台账号列表 + 当前账号状态
+        // 手动刷新：重新拉取三平台账号列表 + 当前账号状态
         public void RefreshAccountsAndStatus()
         {
             LoadAccountsAsync();
         }
 
-        private void OnAccountsLoaded(List<AccountInfo> trae, List<AccountInfo> wb)
+        private void OnAccountsLoaded(List<AccountInfo> trae, List<AccountInfo> wb, List<AccountInfo> zc)
         {
             _trae.Accounts = trae ?? new List<AccountInfo>();
             string saved = HistoryStore.GetActiveBrand();
@@ -274,18 +328,22 @@ namespace TraeSign
             _wb.Accounts = wb ?? new List<AccountInfo>();
             _wb.ActiveBrand = _wb.Accounts.Count > 0 ? WorkbuddyAuth.Platform : null;
 
+            _zc.Accounts = zc ?? new List<AccountInfo>();
+            _zc.ActiveBrand = _zc.Accounts.Count > 0 ? ZcodeAuth.Platform : null;
+
             if (_form != null && !_form.IsDisposed) _form.RefreshAccounts();
 
-            if (_trae.Accounts.Count == 0 && _wb.Accounts.Count == 0)
+            if (_trae.Accounts.Count == 0 && _wb.Accounts.Count == 0 && _zc.Accounts.Count == 0)
             {
                 UpdateTray();
                 return;
             }
             if (_trae.ActiveBrand != null) _trae.Scheduler.ResetForBrand(_trae.ActiveBrand);
             if (_wb.ActiveBrand != null) _wb.Scheduler.ResetForBrand(_wb.ActiveBrand);
-            // 两平台并行查询状态（只查询，不签到）
+            // 三平台并行查询状态（只查询，不签到；ZCode 发现可领套餐会触发自动领取）
             RunCheckinAsync(true, "Trae", null);
             RunCheckinAsync(true, "WorkBuddy", null);
+            RunCheckinAsync(true, "ZCode", null);
         }
 
         private static bool HasBrand(PlatformSlot slot, string brand)
@@ -331,6 +389,7 @@ namespace TraeSign
         private static CheckinResult RunPlatform(string platform, bool queryOnly, string brand)
         {
             if (platform == WorkbuddyAuth.Platform) return WorkbuddyRunner.Run(queryOnly);
+            if (platform == ZcodeAuth.Platform) return ZcodeRunner.Run(queryOnly);
             return CheckinRunner.Run(queryOnly, brand);
         }
 
@@ -351,7 +410,11 @@ namespace TraeSign
             string who = string.IsNullOrEmpty(userName) ? brand : userName + "（" + brand + "）";
 
             string statusText;
-            if (ok)
+            if (!string.IsNullOrEmpty(r.DisplayText))
+            {
+                statusText = who + " " + r.DisplayText;
+            }
+            else if (ok)
             {
                 statusText = who + " 今日已签到";
                 if (r.Base.HasValue || r.Extra.HasValue)
@@ -373,8 +436,9 @@ namespace TraeSign
 
             if (!string.IsNullOrEmpty(r.Username)) HistoryStore.SetUser(brand, r.Username);
 
-            // 查询模式只在"已签到"时落库；签到模式无论成败都落库
-            if (!queryOnly || ok)
+            // 查询模式只在"已签到"时落库；签到模式无论成败都落库（ZCode 无活动查询不落库）
+            bool zcNoop = (slot.Platform == "ZCode" && r.Already);
+            if ((!queryOnly || ok) && !zcNoop)
                 HistoryStore.Upsert(new HistoryEntry
                 {
                     brand = brand,
@@ -388,8 +452,15 @@ namespace TraeSign
                     ts = DateTimeOffset.Now.ToUnixTimeSeconds()
                 });
 
-            // 调度状态：只有真实签到尝试才回填（查询不改调度）
-            if (!queryOnly) slot.Scheduler.NotifyResult(r);
+            // 调度状态：只有真实签到尝试才回填（查询不改调度；ZCode 用轮询器）
+            if (!queryOnly && slot.Scheduler != null) slot.Scheduler.NotifyResult(r);
+            if (slot.Platform == "ZCode") ScheduleZcodeNext(r);
+
+            // ZCode 轮询/启动查询发现可领套餐 → 自动领取（已确认全自动策略）
+            if (queryOnly && slot.Platform == "ZCode" && r.HasClaimable)
+            {
+                RunCheckinAsync(false, "ZCode", null);
+            }
 
             if (!queryOnly)
             {
@@ -397,7 +468,7 @@ namespace TraeSign
                 ToolTipIcon ticon;
                 if (r.Already)
                 {
-                    tip = "今天已签到，无需重复签到";
+                    tip = string.IsNullOrEmpty(r.DisplayText) ? "今天已签到，无需重复签到" : r.DisplayText;
                     ticon = ToolTipIcon.Info;
                 }
                 else if (ok)
@@ -457,11 +528,12 @@ namespace TraeSign
         }
     }
 
-    // 两平台账号列表装载结果
+    // 三平台账号列表装载结果
     internal class TwoLists
     {
         public List<AccountInfo> Trae;
         public List<AccountInfo> Wb;
+        public List<AccountInfo> Zc;
     }
 
     // ============ 签到引擎（内置，无外部依赖） ============
@@ -476,7 +548,10 @@ namespace TraeSign
         public int? Extra;
         public string Message;
         public string Brand;
-        public string Platform;      // 所属平台："Trae" / "WorkBuddy"
+        public string Platform;      // 所属平台："Trae" / "WorkBuddy" / "ZCode"
+        public string DisplayText;   // 引擎自定义状态文案（设置后替代默认组合）
+        public bool HasClaimable;    // ZCode：发现可领套餐
+        public long RetryAfterAt;    // ZCode：1005 补货时间（unix 秒；0=未知）
 
         public static CheckinResult Fail(int code, string message, string brand)
         {
@@ -620,6 +695,20 @@ namespace TraeSign
     // HTTP POST/GET JSON（直连，证书失败降级重试一次）
     internal static class HttpApi
     {
+        // User-Agent/Accept 等是 HttpWebRequest 受限头，走 Headers[] 会抛 ArgumentException
+        public static void ApplyHeaders(HttpWebRequest req, Dictionary<string, string> headers)
+        {
+            if (headers == null) return;
+            foreach (var kv in headers)
+            {
+                if (string.Equals(kv.Key, "User-Agent", StringComparison.OrdinalIgnoreCase)) req.UserAgent = kv.Value;
+                else if (string.Equals(kv.Key, "Accept", StringComparison.OrdinalIgnoreCase)) req.Accept = kv.Value;
+                else if (string.Equals(kv.Key, "Content-Type", StringComparison.OrdinalIgnoreCase)) req.ContentType = kv.Value;
+                else if (string.Equals(kv.Key, "Referer", StringComparison.OrdinalIgnoreCase)) req.Referer = kv.Value;
+                else req.Headers[kv.Key] = kv.Value;
+            }
+        }
+
         public static string PostJson(string url, Dictionary<string, string> headers, string bodyJson)
         {
             ApiResp r = SendCore(url, "POST", headers, bodyJson, false);
@@ -645,8 +734,7 @@ namespace TraeSign
             req.ReadWriteTimeout = 60000;
             req.Proxy = null;   // 直连，与 Node https 行为一致
             if (insecure) req.ServerCertificateValidationCallback = delegate { return true; };
-            if (headers != null)
-                foreach (var kv in headers) req.Headers[kv.Key] = kv.Value;
+            ApplyHeaders(req, headers);
             if (method == "POST")
             {
                 req.ContentType = "application/json";
@@ -1394,6 +1482,880 @@ namespace TraeSign
         }
     }
 
+    // ============ AES-256-GCM 纯托管实现（NIST SP 800-38D；.NET 4.8 无 AesGcm，
+    // 而 CNG P/Invoke 在部分环境（沙箱/安全软件钩 GCM 路径）稳定返回 C000000D，故全托管） ============
+    internal static class ZcodeGcm
+    {
+        // 解密失败（tag 校验不符/长度非法）返回 null
+        public static byte[] Decrypt(byte[] key, byte[] iv, byte[] tag, byte[] cipherText)
+        {
+            if (key == null || iv == null || tag == null || cipherText == null) return null;
+            if (key.Length != 32 || iv.Length != 12 || tag.Length != 16) return null;
+
+            using (var aes = System.Security.Cryptography.Aes.Create())
+            {
+                aes.Mode = System.Security.Cryptography.CipherMode.ECB;
+                aes.Padding = System.Security.Cryptography.PaddingMode.None;
+                aes.KeySize = 256;
+                aes.Key = key;
+                using (var enc = aes.CreateEncryptor())
+                {
+                    // H = E(K, 0^128)
+                    byte[] h = new byte[16];
+                    enc.TransformBlock(h, 0, 16, h, 0);
+
+                    // J0 = IV || 0x00000001（96 位 IV 专属）
+                    byte[] j0 = new byte[16];
+                    Buffer.BlockCopy(iv, 0, j0, 0, 12);
+                    j0[15] = 1;
+
+                    // 明文 = CTR(K, inc32(J0), C)
+                    byte[] plain = new byte[cipherText.Length];
+                    CtrXor(enc, j0, cipherText, plain);
+
+                    // S = GHASH(AAD=空, C, len)
+                    byte[] s = Ghash(h, null, cipherText);
+
+                    // 期望 tag = E(K, J0) XOR S
+                    byte[] ek0 = new byte[16];
+                    enc.TransformBlock(j0, 0, 16, ek0, 0);
+                    Xor(ek0, s);
+                    for (int i = 0; i < 16; i++)
+                        if (ek0[i] != tag[i]) return null;
+                    return plain;
+                }
+            }
+        }
+
+        private static void CtrXor(System.Security.Cryptography.ICryptoTransform enc, byte[] j0, byte[] input, byte[] output)
+        {
+            // GCM 规范：密文流计数器从 inc32(J0) 开始（J0 本身只用于 tag 的 E(K,J0)）
+            byte[] counter = (byte[])j0.Clone();
+            byte[] stream = new byte[16];
+            for (int off = 0; off < input.Length; off += 16)
+            {
+                Inc32(counter);
+                enc.TransformBlock(counter, 0, 16, stream, 0);
+                int n = Math.Min(16, input.Length - off);
+                for (int i = 0; i < n; i++) output[off + i] = (byte)(input[off + i] ^ stream[i]);
+            }
+        }
+
+        private static void Inc32(byte[] block)
+        {
+            for (int i = 15; i >= 12; i--)
+            {
+                block[i] = (byte)(block[i] + 1);
+                if (block[i] != 0) break;
+            }
+        }
+
+        // GHASH_H(AAD, C)：Y=0，逐块 Y=(Y^B)·H，末尾补长度块（AAD 位长 || C 位长，各 64 位大端）
+        private static byte[] Ghash(byte[] h, byte[] aad, byte[] cipher)
+        {
+            byte[] y = new byte[16];
+            if (aad != null && aad.Length > 0)
+            {
+                byte[] ab = new byte[16];
+                int off = 0;
+                while (off < aad.Length)
+                {
+                    int n = Math.Min(16, aad.Length - off);
+                    Array.Clear(ab, 0, 16);
+                    Buffer.BlockCopy(aad, off, ab, 0, n);
+                    Xor(y, ab);
+                    byte[] m = GfMul(y, h);
+                    Buffer.BlockCopy(m, 0, y, 0, 16);
+                    off += 16;
+                }
+            }
+            byte[] cb = new byte[16];
+            int co = 0;
+            while (co < cipher.Length)
+            {
+                int n = Math.Min(16, cipher.Length - co);
+                Array.Clear(cb, 0, 16);
+                Buffer.BlockCopy(cipher, co, cb, 0, n);
+                Xor(y, cb);
+                byte[] m = GfMul(y, h);
+                Buffer.BlockCopy(m, 0, y, 0, 16);
+                co += 16;
+            }
+            byte[] lenBlock = new byte[16];
+            WriteULongBE(lenBlock, 0, aad != null ? (ulong)aad.Length * 8 : 0);
+            WriteULongBE(lenBlock, 8, (ulong)cipher.Length * 8);
+            Xor(y, lenBlock);
+            return GfMul(y, h);
+        }
+
+        // GF(2^128) 乘法（NIST 反射位序），Z·V 迭代
+        private static byte[] GfMul(byte[] x, byte[] h)
+        {
+            byte[] z = new byte[16];
+            byte[] v = new byte[16];
+            Buffer.BlockCopy(h, 0, v, 0, 16);
+            for (int i = 0; i < 128; i++)
+            {
+                if ((x[i >> 3] & (byte)(0x80 >> (i & 7))) != 0) Xor(z, v);
+                int lsb = v[15] & 1;
+                RightShift1(v);
+                if (lsb != 0) v[0] ^= 0xE1;
+            }
+            return z;
+        }
+
+        private static void RightShift1(byte[] b)
+        {
+            for (int i = 15; i > 0; i--)
+                b[i] = (byte)(((b[i] & 0xFE) >> 1) | ((b[i - 1] & 1) << 7));
+            b[0] = (byte)(b[0] >> 1);
+        }
+
+        private static void Xor(byte[] dst, byte[] src)
+        {
+            for (int i = 0; i < 16; i++) dst[i] ^= src[i];
+        }
+
+        private static void WriteULongBE(byte[] b, int off, ulong v)
+        {
+            for (int i = 0; i < 8; i++) b[off + i] = (byte)(v >> (56 - i * 8));
+        }
+    }
+
+
+    // ============ ZCode 凭证（解密 ~/.zcode/v2/credentials.json 的 enc:v1 JWT） ============
+    internal static class ZcodeAuth
+    {
+        public const string Platform = "ZCode";
+        public const string BaseUrl = "https://zcode.z.ai/api/v1";
+        public const string AppVersion = "3.14.3";   // 与官方桌面端现行版一致；preview 按 app_version 过滤活动可见性
+        public const string EncPrefix = "enc:v1:";
+
+        public static string CredentialsPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "v2", "credentials.json"); }
+        }
+
+        // 与 zcode CLI 一致的密钥种子：优先环境变量，否则机器信息回退
+        public static string ResolveSecret()
+        {
+            string env = Environment.GetEnvironmentVariable("ZCODE_CREDENTIAL_SECRET");
+            if (!string.IsNullOrEmpty(env)) return env.Trim();
+            string user = "unknown";
+            try { user = Environment.UserName; } catch { }
+            if (string.IsNullOrEmpty(user)) user = "unknown";
+            return "zcode-credential-fallback:win32:" + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + ":" + user;
+        }
+
+        public static byte[] DeriveKey(string secret)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return sha.ComputeHash(Encoding.UTF8.GetBytes(secret ?? ""));
+        }
+
+        // 解密 enc:v1:<iv b64url>.<tag b64url>.<ct b64url>；失败返回 null
+        public static string DecryptWithSecret(string enc, string secret)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(enc) || !enc.StartsWith(EncPrefix)) return null;
+                string[] parts = enc.Substring(EncPrefix.Length).Split('.');
+                if (parts.Length != 3) return null;
+                byte[] iv = Base64UrlDecodeBytes(parts[0]);
+                byte[] tag = Base64UrlDecodeBytes(parts[1]);
+                byte[] ct = Base64UrlDecodeBytes(parts[2]);
+                if (iv == null || tag == null || ct == null) return null;
+                if (iv.Length != 12 || tag.Length != 16 || ct.Length == 0) return null;
+                byte[] plain = ZcodeGcm.Decrypt(DeriveKey(secret), iv, tag, ct);
+                return plain == null ? null : Encoding.UTF8.GetString(plain);
+            }
+            catch { return null; }
+        }
+
+        public static byte[] Base64UrlDecodeBytes(string s)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(s)) return null;
+                string t = s.Replace('-', '+').Replace('_', '/');
+                int pad = (4 - t.Length % 4) % 4;
+                if (pad > 0) t = t + new string('=', pad);
+                return Convert.FromBase64String(t);
+            }
+            catch { return null; }
+        }
+
+        public static string Base64UrlDecode(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            string t = s.Replace('-', '+').Replace('_', '/');
+            int pad = (4 - t.Length % 4) % 4;
+            if (pad > 0) t = t + new string('=', pad);
+            return Encoding.UTF8.GetString(Convert.FromBase64String(t));
+        }
+
+        // 取 JWT（解密失败/未登录返回 null）；JWT 仅在内存使用
+        public static string GetJwt()
+        {
+            try
+            {
+                if (!File.Exists(CredentialsPath)) return null;
+                var s = JsonUtil.ParseJson(File.ReadAllText(CredentialsPath, Encoding.UTF8));
+                if (s == null) return null;
+                object v;
+                if (!s.TryGetValue("zcodejwttoken", out v)) return null;
+                string enc = v as string;
+                if (string.IsNullOrEmpty(enc) || !enc.StartsWith(EncPrefix)) return null;
+                return DecryptWithSecret(enc, ResolveSecret());
+            }
+            catch { return null; }
+        }
+
+        public static string JwtUserId(string jwt)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(jwt)) return null;
+                string[] parts = jwt.Split('.');
+                if (parts.Length < 2) return null;
+                var d = JsonUtil.ParseJson(Base64UrlDecode(parts[1]));
+                if (d == null) return null;
+                object v;
+                if (d.TryGetValue("user_id", out v) && v != null) return v.ToString();
+                if (d.TryGetValue("sub", out v) && v != null) return v.ToString();
+                return null;
+            }
+            catch { return null; }
+        }
+
+        public static List<AccountInfo> ListAccounts()
+        {
+            var list = new List<AccountInfo>();
+            string jwt = GetJwt();
+            if (string.IsNullOrEmpty(jwt)) return list;
+            var info = new AccountInfo();
+            info.Brand = Platform;
+            info.Username = JwtUserId(jwt);
+            info.HasToken = true;
+            list.Add(info);
+            return list;
+        }
+    }
+
+    // ============ ZCode 本地状态（device_mid + 已领套餐去重） ============
+    internal class ZcodeClaimedDto
+    {
+        public string plan_id;
+        public string name;
+        public long units;
+        public long ts;
+    }
+
+    internal class ZcodeStateDto
+    {
+        public string device_mid;
+        public List<ZcodeClaimedDto> claimed = new List<ZcodeClaimedDto>();
+    }
+
+    internal static class ZcodeState
+    {
+        public static string StatePath { get { return Path.Combine(HistoryStore.DataDir, "zcode_state.json"); } }
+
+        public static ZcodeStateDto Load()
+        {
+            try
+            {
+                if (File.Exists(StatePath))
+                {
+                    var dto = new JavaScriptSerializer().Deserialize<ZcodeStateDto>(File.ReadAllText(StatePath, Encoding.UTF8));
+                    if (dto != null)
+                    {
+                        if (dto.claimed == null) dto.claimed = new List<ZcodeClaimedDto>();
+                        return dto;
+                    }
+                }
+            }
+            catch { }
+            return new ZcodeStateDto();
+        }
+
+        public static void Save(ZcodeStateDto state)
+        {
+            try
+            {
+                if (!Directory.Exists(HistoryStore.DataDir)) Directory.CreateDirectory(HistoryStore.DataDir);
+                string json = new JavaScriptSerializer().Serialize(state);
+                string tmp = StatePath + ".tmp";
+                File.WriteAllText(tmp, json, new UTF8Encoding(false));
+                if (File.Exists(StatePath)) File.Replace(tmp, StatePath, null);
+                else File.Move(tmp, StatePath);
+            }
+            catch { }
+        }
+
+        public static string GetDeviceMid()
+        {
+            var st = Load();
+            if (!string.IsNullOrEmpty(st.device_mid)) return st.device_mid;
+            string mid = Guid.NewGuid().ToString();
+            st.device_mid = mid;
+            Save(st);
+            return mid;
+        }
+
+        public static bool IsClaimed(string planId)
+        {
+            if (string.IsNullOrEmpty(planId)) return false;
+            var st = Load();
+            foreach (var c in st.claimed)
+                if (c != null && c.plan_id == planId) return true;
+            return false;
+        }
+
+        public static void MarkClaimed(string planId, string name, long units)
+        {
+            if (string.IsNullOrEmpty(planId)) return;
+            var st = Load();
+            foreach (var c in st.claimed)
+                if (c != null && c.plan_id == planId) return;
+            st.claimed.Add(new ZcodeClaimedDto { plan_id = planId, name = name, units = units, ts = DateTimeOffset.Now.ToUnixTimeSeconds() });
+            if (st.claimed.Count > 200) st.claimed.RemoveRange(0, st.claimed.Count - 200);
+            Save(st);
+        }
+    }
+
+    // ============ ZCode 阿里云无痕验证码（真实 Edge + CDP，零外部依赖） ============
+    internal static class ZcodeCaptcha
+    {
+        private const int SolveTimeoutMs = 90000;
+        private const int PollIntervalMs = 1000;
+
+        public static string FindEdgePath()
+        {
+            string[] candidates = new string[]
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe")
+            };
+            foreach (string p in candidates)
+                if (File.Exists(p)) return p;
+            try
+            {
+                using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"))
+                {
+                    if (k != null)
+                    {
+                        object v = k.GetValue(null);
+                        if (v != null)
+                        {
+                            string p = Environment.ExpandEnvironmentVariables(v.ToString());
+                            if (File.Exists(p)) return p;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // sceneId/region/prefix 来自 client/configs（失败用社区实测默认值）
+        public static string Solve()
+        {
+            string scene = "11xygtvd", region = "sgp", prefix = "no8xfe";
+            try
+            {
+                ApiResp r = HttpApi.GetWithStatus(ZcodeAuth.BaseUrl + "/client/configs?app_version=" + ZcodeAuth.AppVersion, null);
+                if (r != null && r.Ok && !string.IsNullOrEmpty(r.Body))
+                {
+                    var cfg = JsonUtil.GetDict(JsonUtil.GetDict(JsonUtil.GetDict(JsonUtil.ParseJson(r.Body), "data"), "configs"), "captcha");
+                    if (cfg != null)
+                    {
+                        string s = JsonUtil.GetString(cfg, "sceneId");
+                        string rg = JsonUtil.GetString(cfg, "region");
+                        string pf = JsonUtil.GetString(cfg, "prefix");
+                        if (!string.IsNullOrEmpty(s)) scene = s;
+                        if (!string.IsNullOrEmpty(rg)) region = rg;
+                        if (!string.IsNullOrEmpty(pf)) prefix = pf;
+                    }
+                }
+            }
+            catch { }
+            return SolveWithScene(scene, region, prefix);
+        }
+
+        private static string SolveWithScene(string scene, string region, string prefix)
+        {
+            string edge = FindEdgePath();
+            if (string.IsNullOrEmpty(edge)) throw new Exception("未找到 Edge 浏览器，无法完成验证码");
+            string html = BuildCaptchaHtml(scene, region, prefix);
+            string tmpDir = Path.Combine(Path.GetTempPath(), "TraeSign_cdp_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(tmpDir);
+            string htmlPath = Path.Combine(tmpDir, "captcha.html");
+            File.WriteAllText(htmlPath, html, new UTF8Encoding(false));
+            string fileUrl = "file:///" + htmlPath.Replace('\\', '/');
+
+            int port = GetFreePort();
+            var psi = new ProcessStartInfo();
+            psi.FileName = edge;
+            psi.Arguments = "--remote-debugging-port=" + port + " --user-data-dir=\"" + Path.Combine(tmpDir, "profile") + "\" --no-first-run --no-default-browser-check --window-size=420,300 --app=" + fileUrl;
+            psi.UseShellExecute = false;
+            Process proc = Process.Start(psi);
+            try
+            {
+                string wsUrl = WaitForPageWs(port, 20000);
+                return EvalUntilParam(wsUrl, SolveTimeoutMs);
+            }
+            finally
+            {
+                try { if (proc != null && !proc.HasExited) Process.Start("taskkill", "/PID " + proc.Id + " /T /F"); } catch { }
+                try { Directory.Delete(tmpDir, true); } catch { }
+            }
+        }
+
+        private static string BuildCaptchaHtml(string scene, string region, string prefix)
+        {
+            var sb = new StringBuilder();
+            sb.Append("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>TraeSign</title></head><body>");
+            sb.Append("<div id=\"cap\"></div><button id=\"btn\">go</button>");
+            sb.Append("<script src=\"https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js\"></script><script>");
+            sb.Append("window.__P=null;window.__E=null;");
+            sb.Append("(function t(){if(typeof initAliyunCaptcha!==\"function\"){setTimeout(t,200);return}");
+            sb.Append("initAliyunCaptcha({SceneId:").Append(JsonQuote(scene));
+            sb.Append(",mode:\"popup\",region:").Append(JsonQuote(region));
+            sb.Append(",prefix:").Append(JsonQuote(prefix));
+            sb.Append(",language:\"zh-cn\",element:\"#cap\",button:\"#btn\"");
+            sb.Append(",getInstance:function(i){(i.startTracelessVerification||i.show).call(i)}");
+            // 实测：无痕验证成功时 success 回调参数本身就是 verifyParam 字符串
+            sb.Append(",success:function(r){window.__P=(typeof r===\"string\")?r:((r&&r.captchaVerifyParam)||JSON.stringify(r))}");
+            sb.Append(",fail:function(e){window.__E=\"fail:\"+JSON.stringify(e)}");
+            sb.Append(",onError:function(e){window.__E=\"onError:\"+JSON.stringify(e)}});})();");
+            sb.Append("</script></body></html>");
+            return sb.ToString();
+        }
+
+        private static string JsonQuote(string s)
+        {
+            return new JavaScriptSerializer().Serialize(s ?? "");
+        }
+
+        private static int GetFreePort()
+        {
+            var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            l.Start();
+            int port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+            l.Stop();
+            return port;
+        }
+
+        private static ApiResp HttpGetLocal(string url)
+        {
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "GET";
+                req.Timeout = 3000;
+                req.ReadWriteTimeout = 3000;
+                req.Proxy = null;
+                using (var resp = req.GetResponse())
+                using (var rs = resp.GetResponseStream())
+                using (var sr = new StreamReader(rs, Encoding.UTF8))
+                    return new ApiResp { Status = 200, Body = sr.ReadToEnd() };
+            }
+            catch (WebException ex)
+            {
+                var r = new ApiResp();
+                if (ex.Response != null)
+                {
+                    try
+                    {
+                        using (var rs = ex.Response.GetResponseStream())
+                        using (var sr = new StreamReader(rs, Encoding.UTF8)) r.Body = sr.ReadToEnd();
+                        r.Status = (int)((HttpWebResponse)ex.Response).StatusCode;
+                    }
+                    catch { }
+                }
+                return r;
+            }
+            catch { return new ApiResp(); }
+        }
+
+        private static string WaitForPageWs(int port, int timeoutMs)
+        {
+            DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
+            while (DateTime.Now < deadline)
+            {
+                Thread.Sleep(500);
+                ApiResp r = HttpGetLocal("http://127.0.0.1:" + port + "/json/list");
+                if (r.Status != 200 || string.IsNullOrEmpty(r.Body)) continue;
+                var s = new JavaScriptSerializer();
+                object arr = null;
+                try { arr = s.DeserializeObject(r.Body); } catch { }
+                var list = arr as System.Collections.ArrayList;
+                if (list == null) continue;
+                foreach (object item in list)
+                {
+                    var d = item as Dictionary<string, object>;
+                    if (d == null) continue;
+                    object type, ws;
+                    if (d.TryGetValue("type", out type) && (type as string) == "page" && d.TryGetValue("webSocketDebuggerUrl", out ws))
+                        return ws as string;
+                }
+            }
+            throw new Exception("Edge 调试端口未就绪");
+        }
+
+        // 连 CDP，轮询 window.__P/__E 直到出参/报错/超时
+        private static string EvalUntilParam(string wsUrl, int timeoutMs)
+        {
+            using (var ws = new System.Net.WebSockets.ClientWebSocket())
+            {
+                ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None).Wait(10000);
+                if (ws.State != System.Net.WebSockets.WebSocketState.Open) throw new Exception("无法连接 Edge 调试通道");
+                DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
+                int msgId = 0;
+                while (DateTime.Now < deadline)
+                {
+                    Thread.Sleep(PollIntervalMs);
+                    string expr = "JSON.stringify({p:window.__P,e:window.__E})";
+                    msgId++;
+                    string req = "{\"id\":" + msgId + ",\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":" + JsonQuote(expr) + ",\"returnByValue\":true}}";
+                    string resp = WsRoundTrip(ws, req, msgId);
+                    if (resp == null) throw new Exception("与 Edge 的调试连接中断");
+                    var root = JsonUtil.ParseJson(resp);
+                    var result = JsonUtil.GetDict(root, "result");
+                    var resultInner = JsonUtil.GetDict(result, "result");
+                    string value = JsonUtil.GetString(resultInner, "value");
+                    if (string.IsNullOrEmpty(value)) continue;
+                    var state = JsonUtil.ParseJson(value);
+                    string p = JsonUtil.GetString(state, "p");
+                    string e = JsonUtil.GetString(state, "e");
+                    if (!string.IsNullOrEmpty(p)) return p;
+                    if (!string.IsNullOrEmpty(e)) throw new Exception("验证码失败：" + e);
+                }
+                throw new Exception("验证码超时（可能触发了人工滑动验证），请稍后重试或在 ZCode 客户端手动领取");
+            }
+        }
+
+        private static string WsRoundTrip(System.Net.WebSockets.ClientWebSocket ws, string req, int msgId)
+        {
+            try
+            {
+                byte[] payload = Encoding.UTF8.GetBytes(req);
+                ws.SendAsync(new ArraySegment<byte>(payload), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None).Wait(10000);
+                var buf = new byte[1 << 16];
+                var sb = new StringBuilder();
+                var cts = new CancellationTokenSource(30000);
+                while (true)
+                {
+                    var seg = new ArraySegment<byte>(buf);
+                    var tr = ws.ReceiveAsync(seg, cts.Token);
+                    if (!tr.Wait(30000)) return null;
+                    var r = tr.Result;
+                    if (r.MessageType == System.Net.WebSockets.WebSocketMessageType.Close) return null;
+                    sb.Append(Encoding.UTF8.GetString(buf, 0, r.Count));
+                    if (r.EndOfMessage)
+                    {
+                        string text = sb.ToString();
+                        sb.Length = 0;
+                        // CDP 会推送事件（无 id），只取匹配的响应
+                        var d = JsonUtil.ParseJson(text);
+                        if (JsonUtil.GetInt(d, "id") == msgId) return text;
+                    }
+                }
+            }
+            catch { return null; }
+        }
+    }
+
+    // ============ ZCode 活动套餐领取引擎 ============
+    internal static class ZcodeRunner
+    {
+        internal class ZcodePlan
+        {
+            public string PlanId;
+            public string Name;
+            public long Units;
+            public string ShowName;
+        }
+
+        // preview 响应 → 可领套餐列表（静态纯函数，供测试）
+        public static List<ZcodePlan> ParsePreviewPlans(string json)
+        {
+            var list = new List<ZcodePlan>();
+            var root = JsonUtil.ParseJson(json);
+            if (JsonUtil.GetInt(root, "code") != 0) return list;
+            var data = JsonUtil.GetDict(root, "data");
+            if (data == null) return list;
+            object plansObj;
+            if (!data.TryGetValue("plans", out plansObj)) return list;
+            var plans = plansObj as System.Collections.ArrayList;   // JavaScriptSerializer 数组即 ArrayList（踩坑 #13）
+            if (plans == null) return list;
+            foreach (object item in plans)
+            {
+                var p = item as Dictionary<string, object>;
+                if (p == null) continue;
+                var plan = new ZcodePlan();
+                plan.PlanId = JsonUtil.GetString(p, "plan_id");
+                plan.Name = JsonUtil.GetString(p, "name");
+                object ents;
+                if (p.TryGetValue("entitlements", out ents))
+                {
+                    var entList = ents as System.Collections.ArrayList;
+                    if (entList != null && entList.Count > 0)
+                    {
+                        var e0 = entList[0] as Dictionary<string, object>;
+                        if (e0 != null)
+                        {
+                            object u;
+                            if (e0.TryGetValue("grant_units", out u) && u != null)
+                            {
+                                try { plan.Units = Convert.ToInt64(u); } catch { }
+                            }
+                            plan.ShowName = JsonUtil.GetString(e0, "show_name");
+                        }
+                    }
+                }
+                if (!string.IsNullOrEmpty(plan.PlanId)) list.Add(plan);
+            }
+            return list;
+        }
+
+        public static CheckinResult Run(bool queryOnly)
+        {
+            string jwt = ZcodeAuth.GetJwt();
+            if (string.IsNullOrEmpty(jwt))
+                return CheckinResult.Fail(-1, "未找到 ZCode 登录态，请先登录 ZCode 客户端或 CLI", ZcodeAuth.Platform);
+            string userId = ZcodeAuth.JwtUserId(jwt);
+            string deviceMid = ZcodeState.GetDeviceMid();
+
+            try
+            {
+                ReportActivation(deviceMid);   // 激活事件（best effort，疑似投放资格信号）
+
+                ApiResp pv = Preview(deviceMid, jwt);
+                if (pv == null)
+                    return CheckinResult.Fail(-3, "网络异常：ZCode 服务不可达", ZcodeAuth.Platform);
+                int code = JsonUtil.GetInt(JsonUtil.ParseJson(pv.Body), "code");
+                if (pv.Status == 401 || code == 401)
+                    return CheckinResult.Fail(-6, "ZCode 登录已失效，请重新登录 ZCode 客户端", ZcodeAuth.Platform);
+                if (code != 0)
+                    return CheckinResult.Fail(code, "ZCode 服务返回错误(" + code + ")", ZcodeAuth.Platform);
+
+                List<ZcodePlan> plans = ParsePreviewPlans(pv.Body);
+                ZcodePlan target = null;
+                foreach (var p in plans)
+                    if (!ZcodeState.IsClaimed(p.PlanId)) { target = p; break; }
+
+                if (queryOnly)
+                {
+                    if (target == null)
+                        return new CheckinResult
+                        {
+                            Success = false, Code = 0, CheckedIn = false, Already = true,
+                            Username = userId, Base = null, Extra = null,
+                            DisplayText = plans.Count > 0 ? "暂无可领新套餐" : "暂无可领套餐",
+                            Brand = ZcodeAuth.Platform
+                        };
+                    return new CheckinResult
+                    {
+                        Success = false, Code = 0, CheckedIn = false, Already = false,
+                        Username = userId, HasClaimable = true,
+                        DisplayText = "发现可领套餐：" + (target.Name ?? target.PlanId) + "（" + FormatUnits(target.Units) + "）",
+                        Brand = ZcodeAuth.Platform
+                    };
+                }
+
+                if (target == null)
+                    return new CheckinResult
+                    {
+                        Success = false, Code = 0, CheckedIn = false, Already = true,
+                        Username = userId, DisplayText = "当前无可领新套餐，无需领取",
+                        Brand = ZcodeAuth.Platform
+                    };
+
+                return ClaimPlan(deviceMid, jwt, userId, target);
+            }
+            catch (Exception ex)
+            {
+                return CheckinResult.Fail(-3, "网络异常: " + ex.Message, ZcodeAuth.Platform);
+            }
+        }
+
+        private static CheckinResult ClaimPlan(string deviceMid, string jwt, string userId, ZcodePlan plan)
+        {
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                string vp;
+                try { vp = ZcodeCaptcha.Solve(); }
+                catch (Exception ex)
+                {
+                    if (attempt == 1) return CheckinResult.Fail(-4, "验证码未通过：" + ex.Message, ZcodeAuth.Platform);
+                    continue;
+                }
+
+                var headers = BuildHeaders(deviceMid, jwt);
+                headers["X-Aliyun-Captcha-Verify-Param"] = vp;
+                var body = new Dictionary<string, object>();
+                body["plan_id"] = plan.PlanId;
+                string bodyJson = new JavaScriptSerializer().Serialize(body);
+                ApiResp r = HttpApi.PostWithStatus(ZcodeAuth.BaseUrl + "/zcode-plan/billing/claim", headers, bodyJson);
+                if (r == null || r.Status == 0)
+                    return CheckinResult.Fail(-3, "网络异常：领取请求不可达", ZcodeAuth.Platform);
+
+                var resp = JsonUtil.ParseJson(r.Body);
+                int code = JsonUtil.GetInt(resp, "code");
+                string msg = JsonUtil.GetStringAny(resp, "msg", "message");
+
+                if (r.Status == 401 || code == 401)
+                    return CheckinResult.Fail(-6, "ZCode 登录已失效，请重新登录 ZCode 客户端", ZcodeAuth.Platform);
+                if (code == 0)
+                {
+                    ZcodeState.MarkClaimed(plan.PlanId, plan.Name, plan.Units);
+                    return new CheckinResult
+                    {
+                        Success = true, Code = 0, CheckedIn = true,
+                        Username = userId, Base = (int)Math.Min(plan.Units, int.MaxValue), Extra = null,
+                        DisplayText = "领取成功：" + (plan.Name ?? plan.PlanId) + " +" + FormatUnits(plan.Units) + " token",
+                        Brand = ZcodeAuth.Platform
+                    };
+                }
+                if (code == 3007)
+                {
+                    if (attempt == 1)
+                        return CheckinResult.Fail(3007, "验证码校验失败（已重试一次）", ZcodeAuth.Platform);
+                    continue;   // 换新验证码重试一次
+                }
+                if (code == 1003)
+                {
+                    ZcodeState.MarkClaimed(plan.PlanId, plan.Name, plan.Units);
+                    return new CheckinResult
+                    {
+                        Success = false, Code = 1003, CheckedIn = false, Already = true,
+                        Username = userId, DisplayText = "该套餐已领取过", Brand = ZcodeAuth.Platform
+                    };
+                }
+                if (code == 1005)
+                {
+                    var data = JsonUtil.GetDict(resp, "data");
+                    var planData = JsonUtil.GetDict(data, "plan");
+                    long endsAt = 0;
+                    if (planData != null) endsAt = JsonUtil.GetLong(planData, "ends_at");
+                    return new CheckinResult
+                    {
+                        Success = false, Code = 1005, CheckedIn = false,
+                        Username = userId, RetryAfterAt = endsAt,
+                        DisplayText = "名额已领完" + (endsAt > 0 ? "，服务端将于 " + DateTimeOffset.FromUnixTimeSeconds(endsAt).LocalDateTime.ToString("HH:mm") + " 前后补货" : ""),
+                        Brand = ZcodeAuth.Platform
+                    };
+                }
+                if (code == 1002)
+                {
+                    ZcodeState.MarkClaimed(plan.PlanId, plan.Name, plan.Units);   // 活动已结束，标记避免反复尝试
+                    return CheckinResult.Fail(1002, "该活动已结束", ZcodeAuth.Platform);
+                }
+                if (code == 1004)
+                {
+                    ZcodeState.MarkClaimed(plan.PlanId, plan.Name, plan.Units);   // 不符合条件，标记避免反复尝试
+                    return CheckinResult.Fail(1004, "不符合领取条件", ZcodeAuth.Platform);
+                }
+                return CheckinResult.Fail(code, msg ?? "领取失败", ZcodeAuth.Platform);
+            }
+            return CheckinResult.Fail(-4, "验证码未通过", ZcodeAuth.Platform);
+        }
+
+        private static Dictionary<string, string> BuildHeaders(string deviceMid, string jwt)
+        {
+            var h = new Dictionary<string, string>();
+            h["Authorization"] = "Bearer " + jwt;
+            h["User-Agent"] = "ZCode/" + ZcodeAuth.AppVersion;
+            h["X-Title"] = "Z Code@electron";
+            h["X-ZCode-App-Version"] = ZcodeAuth.AppVersion;
+            h["X-Platform"] = "win32-x64";
+            h["X-Release-Channel"] = "stable";
+            h["X-Client-Language"] = "zh-CN";
+            h["X-Client-Timezone"] = "Asia/Shanghai";
+            h["X-Os-Category"] = "windows";
+            h["X-Os-Version"] = Environment.OSVersion.Version.ToString();
+            // billing 全家桶必需 X-Device-Mid，缺失报 3001
+            h["X-Device-Mid"] = deviceMid;
+            h["x-request-id"] = Guid.NewGuid().ToString();
+            return h;
+        }
+
+        private static void ReportActivation(string deviceMid)
+        {
+            try
+            {
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var body = new Dictionary<string, object>();
+                var events = new List<object>();
+                var e1 = new Dictionary<string, object>();
+                e1["event"] = "app_launch";
+                e1["ts"] = now;
+                events.Add(e1);
+                var e2 = new Dictionary<string, object>();
+                e2["event"] = "app_daily_active";
+                e2["ts"] = now;
+                events.Add(e2);
+                body["events"] = events;
+                string json = new JavaScriptSerializer().Serialize(body);
+                var h = new Dictionary<string, string>();
+                h["X-Device-Mid"] = deviceMid;
+                h["x-request-id"] = Guid.NewGuid().ToString();
+                HttpApi.PostWithStatus(ZcodeAuth.BaseUrl + "/event/report", h, json);
+            }
+            catch { }
+        }
+
+        private static ApiResp Preview(string deviceMid, string jwt)
+        {
+            string platform = Environment.Is64BitOperatingSystem ? "win32-x64" : "win32-x86";
+            string url = ZcodeAuth.BaseUrl + "/zcode-plan/billing/preview?app_version=" + ZcodeAuth.AppVersion + "&platform=" + platform;
+            return HttpGetBilling(url, BuildHeaders(deviceMid, jwt));
+        }
+
+        private static ApiResp HttpGetBilling(string url, Dictionary<string, string> headers)
+        {
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "GET";
+                req.Timeout = 60000;
+                req.ReadWriteTimeout = 60000;
+                req.Proxy = null;
+                HttpApi.ApplyHeaders(req, headers);
+                using (var resp = req.GetResponse())
+                using (var rs = resp.GetResponseStream())
+                using (var sr = new StreamReader(rs, Encoding.UTF8))
+                    return new ApiResp { Status = (int)((HttpWebResponse)resp).StatusCode, Body = sr.ReadToEnd() };
+            }
+            catch (WebException ex)
+            {
+                var r = new ApiResp();
+                if (ex.Response != null)
+                {
+                    try
+                    {
+                        var hr = (HttpWebResponse)ex.Response;
+                        r.Status = (int)hr.StatusCode;
+                        using (var rs = hr.GetResponseStream())
+                        using (var sr = new StreamReader(rs, Encoding.UTF8)) r.Body = sr.ReadToEnd();
+                    }
+                    catch { }
+                }
+                return r;
+            }
+            catch { return null; }
+        }
+
+        private static string FormatUnits(long units)
+        {
+            if (units >= 100000000L && units % 100000000L == 0) return (units / 100000000L) + " 亿";
+            if (units >= 10000L && units % 10000L == 0) return (units / 10000L) + " 万";
+            return units.ToString();
+        }
+    }
+
     // ============ 历史记录 ============
     internal class HistoryEntry
     {
@@ -1683,14 +2645,19 @@ namespace TraeSign
         private GroupBox _calendarGroup;
         private CalendarControl _calendar;
         private bool _changingCombo;
+        private DateTime _calShownDate;   // 日历当前渲染对应的"今天"，用于跨天自动翻月
 
         public PlatformPanel(TrayApp app, string platform)
         {
             _app = app;
             Platform = platform;
             _changingCombo = false;
+            _calShownDate = DateTime.MinValue;
             Dock = DockStyle.Fill;
             Font = new Font("Microsoft YaHei UI", 9f);
+
+            bool isWb = (platform == "WorkBuddy");
+            bool isZc = (platform == "ZCode");
 
             // ---- 账号区 ----
             var accGroup = new GroupBox();
@@ -1706,7 +2673,7 @@ namespace TraeSign
             _accountCombo.SelectedIndexChanged += delegate { OnAccountChanged(); };
 
             _refreshBtn = new Button();
-            _refreshBtn.Text = platform == "WorkBuddy" ? "刷新状态" : "刷新账号状态";
+            _refreshBtn.Text = isWb || isZc ? "刷新状态" : "刷新账号状态";
             _refreshBtn.Location = new Point(330, 21);
             _refreshBtn.Size = new Size(84, 25);
             _refreshBtn.Click += delegate { _app.RefreshAccountsAndStatus(); };
@@ -1715,28 +2682,28 @@ namespace TraeSign
             _authBtn.Text = "登录授权";
             _authBtn.Location = new Point(330, 50);
             _authBtn.Size = new Size(84, 25);
-            _authBtn.Visible = (platform == "WorkBuddy");
+            _authBtn.Visible = isWb;
             _authBtn.Click += delegate { _app.StartWorkbuddyAuthAsync(); };
 
             _accountDetailLabel = new Label();
             _accountDetailLabel.Location = new Point(14, 52);
             _accountDetailLabel.AutoSize = false;
             _accountDetailLabel.Height = 40;
-            _accountDetailLabel.Width = platform == "WorkBuddy" ? 310 : 400;
-            _accountDetailLabel.Text = platform == "WorkBuddy"
-                ? "未授权：点击“登录授权”完成一次浏览器登录"
-                : "未找到登录态，请先运行 Trae 桌面端登录";
+            _accountDetailLabel.Width = (isWb || isZc) ? 310 : 400;
+            _accountDetailLabel.Text = isZc
+                ? "未找到 ZCode 登录态，请先登录 ZCode 客户端或 CLI"
+                : (isWb ? "未授权：点击“登录授权”完成一次浏览器登录" : "未找到登录态，请先运行 Trae 桌面端登录");
 
             accGroup.Controls.Add(_accountCombo);
             accGroup.Controls.Add(_refreshBtn);
             accGroup.Controls.Add(_authBtn);
             accGroup.Controls.Add(_accountDetailLabel);
 
-            // ---- 今日签到区 ----
+            // ---- 今日签到区 / 套餐领取区 ----
             var todayGroup = new GroupBox();
             todayGroup.Dock = DockStyle.Top;
             todayGroup.Height = 88;
-            todayGroup.Text = "今日签到";
+            todayGroup.Text = isZc ? "套餐领取" : "今日签到";
             todayGroup.Padding = new Padding(10, 6, 10, 4);
 
             _todayStatusLabel = new Label();
@@ -1744,14 +2711,14 @@ namespace TraeSign
             _todayStatusLabel.AutoSize = false;
             _todayStatusLabel.Width = 400;
             _todayStatusLabel.Font = new Font(this.Font.FontFamily, 10f, FontStyle.Bold);
-            _todayStatusLabel.Text = "今日：--";
+            _todayStatusLabel.Text = isZc ? "套餐：--" : "今日：--";
 
             _creditsLabel = new Label();
             _creditsLabel.Location = new Point(14, 50);
             _creditsLabel.AutoSize = false;
             _creditsLabel.Width = 400;
             _creditsLabel.ForeColor = Color.FromArgb(76, 175, 80);
-            _creditsLabel.Text = "积分：--";
+            _creditsLabel.Text = isZc ? "最近领取：--" : "积分：--";
 
             _occupiedLabel = new Label();
             _occupiedLabel.Location = new Point(14, 64);
@@ -1769,7 +2736,7 @@ namespace TraeSign
             var autoGroup = new GroupBox();
             autoGroup.Dock = DockStyle.Top;
             autoGroup.Height = 100;
-            autoGroup.Text = "自动签到";
+            autoGroup.Text = isZc ? "自动领取" : "自动签到";
             autoGroup.Padding = new Padding(10, 6, 10, 6);
 
             _autoNoteLabel = new Label();
@@ -1777,7 +2744,9 @@ namespace TraeSign
             _autoNoteLabel.AutoSize = false;
             _autoNoteLabel.Height = 20;
             _autoNoteLabel.Width = 400;
-            _autoNoteLabel.Text = "每日 00:05 自动签到（" + platform + "）";
+            _autoNoteLabel.Text = isZc
+                ? "每 10 分钟自动检查新活动套餐，发现即自动领取"
+                : "每日 00:05 自动签到（" + platform + "）";
 
             _retryLabel = new Label();
             _retryLabel.Location = new Point(14, 52);
@@ -1788,7 +2757,7 @@ namespace TraeSign
             _retryLabel.Text = "";
 
             _checkinBtn = new Button();
-            _checkinBtn.Text = "立即签到（手动）";
+            _checkinBtn.Text = isZc ? "检查并领取（手动）" : "立即签到（手动）";
             _checkinBtn.Location = new Point(300, 48);
             _checkinBtn.Size = new Size(122, 32);
             _checkinBtn.Click += delegate { _app.RunCheckinAsync(false, Platform, null); };
@@ -1859,14 +2828,19 @@ namespace TraeSign
             if (slot == null) return;
             string active = slot.ActiveBrand;
             AccountInfo acc = slot.ActiveAccount();
+            bool isZc = (Platform == "ZCode");
+            string todayWord = isZc ? "套餐" : "今日";
+            string creditWord = isZc ? "最近领取" : "积分";
 
             if (acc == null)
             {
-                _accountDetailLabel.Text = Platform == "WorkBuddy"
-                    ? "未找到 WorkBuddy 客户端登录态；可点击“登录授权”直接授权本程序"
-                    : "未找到登录态，请先运行 Trae 桌面端登录";
-                _todayStatusLabel.Text = "今日：--";
-                _creditsLabel.Text = "积分：--";
+                _accountDetailLabel.Text = isZc
+                    ? "未找到 ZCode 登录态，请先登录 ZCode 客户端或 CLI"
+                    : (Platform == "WorkBuddy"
+                        ? "未找到 WorkBuddy 客户端登录态；可点击“登录授权”直接授权本程序"
+                        : "未找到登录态，请先运行 Trae 桌面端登录");
+                _todayStatusLabel.Text = todayWord + "：--";
+                _creditsLabel.Text = creditWord + "：--";
                 _occupiedLabel.Visible = false;
                 _calendarGroup.Text = "签到日历";
                 _calendar.SetData(new Dictionary<string, bool>());
@@ -1889,42 +2863,69 @@ namespace TraeSign
 
                 var entry = HistoryStore.TodayEntry(active);
                 bool ok = entry != null && entry.success;
+                var last = slot.LastResult;
                 if (ok)
                 {
-                    _todayStatusLabel.Text = "今日：已签到";
-                    if (entry.baseCredits.HasValue || entry.extra.HasValue)
-                        _creditsLabel.Text = "积分：+" + (entry.baseCredits.GetValueOrDefault(0) + entry.extra.GetValueOrDefault(0)) + "（基础" + entry.baseCredits + " 额外" + entry.extra + "）";
+                    _todayStatusLabel.Text = todayWord + "：" + (isZc ? "已领取" : "已签到");
+                    if (isZc)
+                        _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.HasValue ? entry.baseCredits.GetValueOrDefault(0).ToString("N0") : "--") + " token";
+                    else if (entry.baseCredits.HasValue || entry.extra.HasValue)
+                        _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.GetValueOrDefault(0) + entry.extra.GetValueOrDefault(0)) + "（基础" + entry.baseCredits + " 额外" + entry.extra + "）";
                     else
-                        _creditsLabel.Text = "积分：已领取";
+                        _creditsLabel.Text = creditWord + "：已领取";
+                    _occupiedLabel.Visible = false;
+                }
+                else if (last != null && last.HasClaimable)
+                {
+                    _todayStatusLabel.Text = todayWord + "：" + last.DisplayText;
+                    _creditsLabel.Text = creditWord + "：--";
+                    _occupiedLabel.Visible = false;
+                }
+                else if (last != null && last.Already && isZc)
+                {
+                    _todayStatusLabel.Text = todayWord + "：暂无可领新套餐";
+                    _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }
                 else if (entry != null && entry.occupied)
                 {
                     _todayStatusLabel.Text = "今日：未签到（本机已被另一账号签到）";
-                    _creditsLabel.Text = "积分：--";
+                    _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = true;
                 }
                 else if (entry != null && entry.code == -6)
                 {
-                    _todayStatusLabel.Text = "今日：" + (Platform == "WorkBuddy" ? "登录已失效，请重新授权" : "账号状态异常（token 可能已过期）");
-                    _creditsLabel.Text = "积分：--";
+                    _todayStatusLabel.Text = "今日：" + (isZc ? "登录已失效，请重新登录 ZCode" : (Platform == "WorkBuddy" ? "登录已失效，请重新授权" : "账号状态异常（token 可能已过期）"));
+                    _creditsLabel.Text = creditWord + "：--";
+                    _occupiedLabel.Visible = false;
+                }
+                else if (last != null && !string.IsNullOrEmpty(last.DisplayText) && !ok)
+                {
+                    _todayStatusLabel.Text = todayWord + "：" + last.DisplayText;
+                    _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }
                 else
                 {
-                    _todayStatusLabel.Text = "今日：未签到";
-                    _creditsLabel.Text = "积分：--";
+                    _todayStatusLabel.Text = todayWord + "：" + (isZc ? "待检查" : "未签到");
+                    _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }
             }
 
-            _autoNoteLabel.Text = "每日 00:05 自动签到（" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
+            _autoNoteLabel.Text = isZc
+                ? "每 10 分钟自动检查新活动套餐（登录名：" + (string.IsNullOrEmpty(acc.Username) ? "--" : acc.Username) + "）"
+                : "每日 00:05 自动签到（" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
             var retry = slot.Scheduler != null ? slot.Scheduler.NextRetryAt : null;
-            _retryLabel.Text = retry.HasValue
-                ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm")
-                : "自动签到已开启，失败后自动重试";
+            _retryLabel.Text = isZc
+                ? "发现新套餐会自动领取并气泡通知"
+                : (retry.HasValue
+                    ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm")
+                    : "自动签到已开启，失败后自动重试");
 
-            _calendarGroup.Text = "签到日历（账号：" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
+            _calendarGroup.Text = isZc
+                ? "领取日历（登录名：" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）"
+                : "签到日历（账号：" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
             RefreshCalendar();
         }
 
@@ -1939,15 +2940,29 @@ namespace TraeSign
             return iso;
         }
 
+        // 跨天判定（纯函数，供测试）：日期变化后日历应翻到新月
+        public static bool ShouldSnapMonth(DateTime shownDate, DateTime now)
+        {
+            return shownDate.Date != now.Date;
+        }
+
         private void RefreshCalendar()
         {
+            // 修复：应用跨天运行后日历仍停在旧月份（如 10/1 签到但日历显示 9 月）
+            // 检测到日期变化即自动翻到当前月；同一天内手动 ◀▶ 翻月不受影响
+            DateTime now = DateTime.Now;
+            if (ShouldSnapMonth(_calShownDate, now))
+            {
+                _calShownDate = now.Date;
+                _calendar.SetMonth(now);
+            }
             var slot = _app.Slot(Platform);
             string brand = (slot != null && !string.IsNullOrEmpty(slot.ActiveBrand)) ? slot.ActiveBrand : Platform;
             _calendar.SetData(HistoryStore.SuccessMap(_calendar.CurrentMonth.Year, _calendar.CurrentMonth.Month, brand));
         }
     }
 
-    // ============ 主窗口（标题行 + 双平台 Tab） ============
+    // ============ 主窗口（标题行 + 三平台 Tab） ============
     internal class MainForm : Form
     {
         private readonly TrayApp _app;
@@ -1955,6 +2970,7 @@ namespace TraeSign
         private TabControl _tabs;
         private PlatformPanel _traePanel;
         private PlatformPanel _wbPanel;
+        private PlatformPanel _zcPanel;
 
         public MainForm(TrayApp app)
         {
@@ -1967,6 +2983,7 @@ namespace TraeSign
             StartPosition = FormStartPosition.CenterScreen;
             ShowInTaskbar = true;
             Font = new Font("Microsoft YaHei UI", 9f);
+            try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             // ---- 标题行 ----
             var titlePanel = new Panel();
@@ -1989,7 +3006,7 @@ namespace TraeSign
             titlePanel.Controls.Add(titleLabel);
             titlePanel.Controls.Add(_titleStatus);
 
-            // ---- 双平台 Tab ----
+            // ---- 三平台 Tab ----
             _tabs = new TabControl();
             _tabs.Dock = DockStyle.Fill;
 
@@ -2001,8 +3018,13 @@ namespace TraeSign
             _wbPanel = new PlatformPanel(app, "WorkBuddy");
             tpWb.Controls.Add(_wbPanel);
 
+            var tpZc = new TabPage("ZCode");
+            _zcPanel = new PlatformPanel(app, "ZCode");
+            tpZc.Controls.Add(_zcPanel);
+
             _tabs.TabPages.Add(tpTrae);
             _tabs.TabPages.Add(tpWb);
+            _tabs.TabPages.Add(tpZc);
 
             Controls.Add(_tabs);
             Controls.Add(titlePanel);
@@ -2012,6 +3034,7 @@ namespace TraeSign
         {
             _traePanel.RefreshAccounts();
             _wbPanel.RefreshAccounts();
+            _zcPanel.RefreshAccounts();
         }
 
         public void RefreshView()
@@ -2192,6 +3215,35 @@ namespace TraeSign
                 {
                     sb.AppendLine("[SKIP] WB 真实查询（未授权，跳过；完成一次浏览器授权后自测将覆盖）");
                 }
+
+                // 10. ZCode：AES-GCM 向量 / Base64Url / preview 解析 / Edge 探测 / 日历跨天
+                string vec = "enc:v1:Stbd72p7d7tsa9Hy.SwrZebP7w3M_I3_9gMETiQ.vaYnsBO0RkDFeSpTEkNnm-qOrrGMra6c9jaiWuJh5Jk";
+                Check("ZC AES-GCM 向量解密", ZcodeAuth.DecryptWithSecret(vec, "selftest-vector-secret") == "TraeSign-ZCode-vector-2026-10-01");
+                Check("ZC 错误密钥解密失败(null)", ZcodeAuth.DecryptWithSecret(vec, "wrong-secret") == null);
+                // NIST GCM Test Case 13（K=0^32, IV=0^12, 空 C, T=530f...738b）：算法正确性外证
+                byte[] nistK = new byte[32], nistIv = new byte[12], nistTag = HexToBytes("530f8afbc74536b9a963b4f1c4cb738b");
+                byte[] nistPlain = ZcodeGcm.Decrypt(nistK, nistIv, nistTag, new byte[0]);
+                Check("ZC NIST GCM 用例13", nistPlain != null && nistPlain.Length == 0);
+                Check("ZC Base64Url 解码", ZcodeAuth.Base64UrlDecode("eyJhIjoxfQ") == "{\"a\":1}");
+                string pvJson = "{\"code\":0,\"data\":{\"plans\":[{\"plan_id\":\"p1\",\"name\":\"Trust\",\"entitlements\":[{\"show_name\":\"GLM-5.3-Flash\",\"grant_units\":100000000}]}]}}";
+                var zplans = ZcodeRunner.ParsePreviewPlans(pvJson);
+                Check("ZC preview 解析(ArrayList)", zplans.Count == 1 && zplans[0].PlanId == "p1" && zplans[0].Units == 100000000L && zplans[0].ShowName == "GLM-5.3-Flash");
+                Check("ZC 空 plans 解析", ZcodeRunner.ParsePreviewPlans("{\"code\":0,\"data\":{\"plans\":[]}}").Count == 0);
+                Check("ZC 非0 code 解析", ZcodeRunner.ParsePreviewPlans("{\"code\":401,\"msg\":\"x\"}").Count == 0);
+                Check("ZC Edge 路径探测", !string.IsNullOrEmpty(ZcodeCaptcha.FindEdgePath()));
+                Check("ZC 日历跨天判定", PlatformPanel.ShouldSnapMonth(new DateTime(2026, 9, 30), new DateTime(2026, 10, 1))
+                    && !PlatformPanel.ShouldSnapMonth(new DateTime(2026, 10, 1), new DateTime(2026, 10, 1)));
+
+                // 11. ZCode：真实查询（只读 preview，不领取）
+                if (!string.IsNullOrEmpty(ZcodeAuth.GetJwt()))
+                {
+                    var zq = ZcodeRunner.Run(true);
+                    Check("ZC 真实查询(code=" + zq.Code + ")", zq.Code == 0 || zq.Code == -6 || zq.Code == -3);
+                }
+                else
+                {
+                    sb.AppendLine("[SKIP] ZC 真实查询（无 ZCode 登录态，跳过）");
+                }
             }
             catch (Exception ex)
             {
@@ -2211,6 +3263,14 @@ namespace TraeSign
             }
             catch { }
             return fails[0] == 0 ? 0 : 1;
+        }
+
+        private static byte[] HexToBytes(string hex)
+        {
+            byte[] b = new byte[hex.Length / 2];
+            for (int i = 0; i < b.Length; i++)
+                b[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            return b;
         }
     }
 }

@@ -11,6 +11,7 @@ taskkill /IM TraeSign.exe /F >nul 2>&1
   /reference:System.Windows.Forms.dll ^
   /reference:System.Drawing.dll ^
   /reference:System.Web.Extensions.dll ^
+  /reference:System.Security.dll ^
   /win32manifest:app.manifest ^
   TraeCheckinApp.cs CalendarControl.cs
 

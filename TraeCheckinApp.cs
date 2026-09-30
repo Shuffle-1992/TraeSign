@@ -73,24 +73,46 @@ namespace TraeSign
         public override string ToString() { return Display; }
     }
 
-    // ============ 托盘应用上下文 ============
+    // ============ 平台槽位（Trae / WorkBuddy 各一份） ============
+    internal class PlatformSlot
+    {
+        public string Platform;
+        public List<AccountInfo> Accounts = new List<AccountInfo>();
+        public string ActiveBrand;
+        public DailyScheduler Scheduler;
+        public CheckinResult LastResult;
+        public bool Busy;
+
+        public AccountInfo ActiveAccount()
+        {
+            foreach (var a in Accounts)
+                if (a.Brand == ActiveBrand) return a;
+            return Accounts.Count > 0 ? Accounts[0] : null;
+        }
+    }
+
+    // ============ 托盘应用上下文（双平台） ============
     internal class TrayApp : ApplicationContext
     {
         private NotifyIcon _tray;
         private MainForm _form;
-        private DailyScheduler _sched;
-        private bool _busy;
         private static TrayApp _instance;
 
-        private List<AccountInfo> _accounts;
-        private string _activeBrand;
+        private readonly List<PlatformSlot> _slots = new List<PlatformSlot>();
+        private PlatformSlot _trae;
+        private PlatformSlot _wb;
 
         public TrayApp()
         {
             _instance = this;
-            _busy = false;
             _form = null;
-            _accounts = new List<AccountInfo>();
+
+            _trae = new PlatformSlot();
+            _trae.Platform = "Trae";
+            _wb = new PlatformSlot();
+            _wb.Platform = "WorkBuddy";
+            _slots.Add(_trae);
+            _slots.Add(_wb);
 
             _tray = new NotifyIcon();
             _tray.Visible = true;
@@ -99,32 +121,35 @@ namespace TraeSign
             _tray.DoubleClick += delegate { ShowMainWindow(); };
 
             var menu = new ContextMenuStrip();
-            menu.Items.Add("立即签到", null, delegate { RunCheckinAsync(false, _activeBrand); });
-            menu.Items.Add("打开日历", null, delegate { ShowMainWindow(); });
+            menu.Items.Add("立即签到（两平台）", null, delegate
+            {
+                RunCheckinAsync(false, "Trae", null);
+                RunCheckinAsync(false, "WorkBuddy", null);
+            });
+            menu.Items.Add("打开主窗口", null, delegate { ShowMainWindow(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, delegate { ExitApp(); });
             _tray.ContextMenuStrip = menu;
 
-            _sched = new DailyScheduler(this);
-            _sched.Start();
+            foreach (var s in _slots)
+            {
+                s.Scheduler = new DailyScheduler(this, s.Platform);
+                s.Scheduler.Start();
+            }
 
-            // 加载账号列表（后台），完成后刷新状态
+            // 加载两平台账号列表（后台），完成后刷新状态
             LoadAccountsAsync();
         }
 
         public NotifyIcon Tray { get { return _tray; } }
-        public bool Busy { get { return _busy; } }
         public static TrayApp Instance { get { return _instance; } }
-        public List<AccountInfo> Accounts { get { return _accounts; } }
-        public DailyScheduler Scheduler { get { return _sched; } }
-        public string ActiveBrand { get { return _activeBrand; } }
+        public IList<PlatformSlot> Slots { get { return _slots; } }
 
-
-        public AccountInfo ActiveAccount()
+        public PlatformSlot Slot(string platform)
         {
-            foreach (var a in _accounts)
-                if (a.Brand == _activeBrand) return a;
-            return _accounts.Count > 0 ? _accounts[0] : null;
+            foreach (var s in _slots)
+                if (s.Platform == platform) return s;
+            return null;
         }
 
         public static void ShowMainWindow()
@@ -132,7 +157,7 @@ namespace TraeSign
             if (_instance == null) return;
             if (_instance._form == null || _instance._form.IsDisposed)
                 _instance._form = new MainForm(_instance);
-            _instance._form.RefreshAccounts(_instance._accounts);
+            _instance._form.RefreshAccounts();
             _instance._form.RefreshView();
             _instance._form.Show();
             _instance._form.Activate();
@@ -147,102 +172,180 @@ namespace TraeSign
             if (old != null) { old.Dispose(); }
         }
 
+        // 聚合托盘状态：任一平台失败/无登录态→红；全部已签到→绿；否则灰
+        public TrayState ComputeAggregateState(out string tip)
+        {
+            bool allOk = true;
+            bool anyFail = false;
+            var parts = new List<string>();
+            foreach (var s in _slots)
+            {
+                string state;
+                if (s.Accounts.Count == 0)
+                {
+                    state = "未找到登录态";
+                    anyFail = true;
+                    allOk = false;
+                }
+                else if (s.Busy)
+                {
+                    state = "签到中";
+                    allOk = false;
+                }
+                else if (s.LastResult != null && (s.LastResult.Success || s.LastResult.CheckedIn))
+                {
+                    state = "已签到";
+                }
+                else if (s.LastResult != null && s.LastResult.Code == -1 && s.Platform == "WorkBuddy")
+                {
+                    state = "待授权";   // WorkBuddy 未授权属待设置状态，不算异常
+                    allOk = false;
+                }
+                else if (s.LastResult != null)
+                {
+                    state = "未签到";
+                    anyFail = true;
+                    allOk = false;
+                }
+                else
+                {
+                    state = "待查询";
+                    allOk = false;
+                }
+                parts.Add(s.Platform + ":" + state);
+            }
+            tip = "TraeSign - " + string.Join(" | ", parts.ToArray());
+            if (anyFail) return TrayState.Failed;
+            if (allOk) return TrayState.CheckedIn;
+            return TrayState.Unknown;
+        }
+
+        public void UpdateTray()
+        {
+            string tip;
+            TrayState st = ComputeAggregateState(out tip);
+            SetTray(st, tip);
+        }
+
         public void RefreshView()
         {
             if (_form != null && !_form.IsDisposed) _form.RefreshView();
         }
 
-        // 后台加载账号列表
+        // 后台加载两平台账号列表
         public void LoadAccountsAsync()
         {
-            Task.Run(delegate { return CheckinRunner.ListAccounts(); })
+            Task.Run(delegate { return LoadBothLists(); })
                 .ContinueWith(t =>
                 {
-                    List<AccountInfo> list;
-                    try { list = t.Result; }
-                    catch { list = null; }
-                    if (list != null) OnAccountsLoaded(list);
+                    TwoLists both;
+                    try { both = t.Result; }
+                    catch { both = null; }
+                    if (both != null) OnAccountsLoaded(both.Trae, both.Wb);
                 }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
-        // 手动刷新：重新拉取账号列表 + 当前账号状态
+        private static TwoLists LoadBothLists()
+        {
+            var r = new TwoLists();
+            r.Trae = CheckinRunner.ListAccounts();
+            r.Wb = WorkbuddyAuth.ListAccounts();
+            return r;
+        }
+
+        // 手动刷新：重新拉取两平台账号列表 + 当前账号状态
         public void RefreshAccountsAndStatus()
         {
             LoadAccountsAsync();
         }
 
-        private void OnAccountsLoaded(List<AccountInfo> list)
+        private void OnAccountsLoaded(List<AccountInfo> trae, List<AccountInfo> wb)
         {
-            _accounts = list;
-            // 校验/回退 activeBrand
+            _trae.Accounts = trae ?? new List<AccountInfo>();
             string saved = HistoryStore.GetActiveBrand();
-            if (!string.IsNullOrEmpty(saved) && HasBrand(saved))
-                _activeBrand = saved;
-            else if (_accounts.Count > 0)
-                _activeBrand = _accounts[0].Brand;
+            if (!string.IsNullOrEmpty(saved) && HasBrand(_trae, saved))
+                _trae.ActiveBrand = saved;
+            else if (_trae.Accounts.Count > 0)
+                _trae.ActiveBrand = _trae.Accounts[0].Brand;
             else
-                _activeBrand = null;
+                _trae.ActiveBrand = null;
+            if (_trae.ActiveBrand != null) HistoryStore.SetActiveBrand(_trae.ActiveBrand);
 
-            if (_activeBrand != null) HistoryStore.SetActiveBrand(_activeBrand);
-            if (_form != null && !_form.IsDisposed) _form.RefreshAccounts(_accounts);
+            _wb.Accounts = wb ?? new List<AccountInfo>();
+            _wb.ActiveBrand = _wb.Accounts.Count > 0 ? WorkbuddyAuth.Platform : null;
 
-            if (_accounts.Count == 0)
+            if (_form != null && !_form.IsDisposed) _form.RefreshAccounts();
+
+            if (_trae.Accounts.Count == 0 && _wb.Accounts.Count == 0)
             {
-                SetTray(TrayState.Failed, "TraeSign - 未找到登录态");
+                UpdateTray();
                 return;
             }
-            // 调度按当前账号初始化
-            _sched.ResetForBrand(_activeBrand);
-            // 刷新状态（只查询，不签到）
-            RunCheckinAsync(true, _activeBrand);
+            if (_trae.ActiveBrand != null) _trae.Scheduler.ResetForBrand(_trae.ActiveBrand);
+            if (_wb.ActiveBrand != null) _wb.Scheduler.ResetForBrand(_wb.ActiveBrand);
+            // 两平台并行查询状态（只查询，不签到）
+            RunCheckinAsync(true, "Trae", null);
+            RunCheckinAsync(true, "WorkBuddy", null);
         }
 
-        private bool HasBrand(string brand)
+        private static bool HasBrand(PlatformSlot slot, string brand)
         {
-            foreach (var a in _accounts)
+            foreach (var a in slot.Accounts)
                 if (a.Brand == brand) return true;
             return false;
         }
 
-        public void SetActiveBrand(string brand)
+        public void SetActiveBrand(string platform, string brand)
         {
-            if (brand == _activeBrand) return;
-            if (!HasBrand(brand)) return;
-            _activeBrand = brand;
-            HistoryStore.SetActiveBrand(brand);
-            _sched.ResetForBrand(brand);
+            var slot = Slot(platform);
+            if (slot == null || brand == slot.ActiveBrand) return;
+            if (!HasBrand(slot, brand)) return;
+            slot.ActiveBrand = brand;
+            if (platform == "Trae") HistoryStore.SetActiveBrand(brand);
+            slot.Scheduler.ResetForBrand(brand);
             RefreshView();
         }
 
-        public void RunCheckinAsync(bool queryOnly, string brand)
+        public void RunCheckinAsync(bool queryOnly, string platform, string brand)
         {
-            if (_busy) return;
-            if (string.IsNullOrEmpty(brand)) brand = _activeBrand;
-            _busy = true;
+            var slot = Slot(platform);
+            if (slot == null) return;
+            if (slot.Busy) return;
+            if (string.IsNullOrEmpty(brand)) brand = slot.ActiveBrand;
+            slot.Busy = true;
+            UpdateTray();
+            string reqPlatform = platform;
             string reqBrand = brand;
-            if (queryOnly) SetTray(TrayState.Unknown, "TraeSign - 查询中...");
-            else SetTray(TrayState.Unknown, "TraeSign - 正在签到...");
 
-            Task.Run(delegate { return CheckinRunner.Run(queryOnly, reqBrand); })
+            Task.Run(delegate { return RunPlatform(reqPlatform, queryOnly, reqBrand); })
                 .ContinueWith(t =>
                 {
                     CheckinResult r;
                     try { r = t.Result; }
                     catch (Exception ex) { r = CheckinResult.Fail(-6, "调用签到程序异常: " + ex.Message, reqBrand); }
-                    OnCheckinDone(r, queryOnly, reqBrand);
+                    if (r != null) r.Platform = reqPlatform;
+                    OnCheckinDone(slot, r, queryOnly, reqBrand);
                 }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
-        private void OnCheckinDone(CheckinResult r, bool queryOnly, string requestedBrand)
+        private static CheckinResult RunPlatform(string platform, bool queryOnly, string brand)
         {
-            _busy = false;
+            if (platform == WorkbuddyAuth.Platform) return WorkbuddyRunner.Run(queryOnly);
+            return CheckinRunner.Run(queryOnly, brand);
+        }
+
+        private void OnCheckinDone(PlatformSlot slot, CheckinResult r, bool queryOnly, string requestedBrand)
+        {
+            slot.Busy = false;
+            slot.LastResult = r;
+            if (r == null) { UpdateTray(); return; }
             string brand = r.Brand ?? requestedBrand;
             bool ok = r.Success || r.CheckedIn;
 
             string userName = r.Username;
             if (string.IsNullOrEmpty(userName))
             {
-                var acc = ActiveAccount();
+                var acc = slot.ActiveAccount();
                 if (acc != null) userName = acc.Username;
             }
             string who = string.IsNullOrEmpty(userName) ? brand : userName + "（" + brand + "）";
@@ -253,23 +356,20 @@ namespace TraeSign
                 statusText = who + " 今日已签到";
                 if (r.Base.HasValue || r.Extra.HasValue)
                     statusText = who + " 今日已签到 +" + (r.Base.GetValueOrDefault(0) + r.Extra.GetValueOrDefault(0)) + "（基础" + r.Base + " 额外" + r.Extra + "）";
-                SetTray(TrayState.CheckedIn, "TraeSign - " + statusText);
             }
             else if (r.Code == 9095)
             {
                 statusText = who + " 本机今日已被另一账号签到";
-                SetTray(TrayState.Failed, "TraeSign - " + statusText);
             }
             else if (r.Code == -6)
             {
-                statusText = who + " 账号状态异常（token 可能已过期），请重新登录该软件或刷新账号状态";
-                SetTray(TrayState.Failed, "TraeSign - " + statusText);
+                statusText = who + " " + (string.IsNullOrEmpty(r.Message) ? "账号状态异常（token 可能已过期）" : r.Message);
             }
             else
             {
-                statusText = who + " 签到失败：" + (string.IsNullOrEmpty(r.Message) ? "未知原因" : r.Message);
-                SetTray(TrayState.Failed, "TraeSign - " + statusText);
+                statusText = who + " " + (string.IsNullOrEmpty(r.Message) ? "签到失败：未知原因" : r.Message);
             }
+            UpdateTray();
 
             if (!string.IsNullOrEmpty(r.Username)) HistoryStore.SetUser(brand, r.Username);
 
@@ -289,7 +389,7 @@ namespace TraeSign
                 });
 
             // 调度状态：只有真实签到尝试才回填（查询不改调度）
-            if (!queryOnly) _sched.NotifyResult(r);
+            if (!queryOnly) slot.Scheduler.NotifyResult(r);
 
             if (!queryOnly)
             {
@@ -313,8 +413,39 @@ namespace TraeSign
                 _tray.ShowBalloonTip(5000, "TraeSign", tip, ticon);
             }
 
-            // 仅当结果账号仍是当前选中账号时才刷新窗体（避免旧结果污染切换后的视图）
-            if (brand == _activeBrand) RefreshView();
+            RefreshView();
+        }
+
+        // WorkBuddy 首次授权：打开浏览器 → 轮询 token → 落库 → 重新加载
+        public void StartWorkbuddyAuthAsync()
+        {
+            if (_wb.Busy) return;
+            _wb.Busy = true;
+            UpdateTray();
+            _tray.ShowBalloonTip(5000, "TraeSign", "WorkBuddy：已打开浏览器，请在页面完成授权登录（3 分钟内有效）", ToolTipIcon.Info);
+            string authError = null;
+            Task.Run(delegate { return WorkbuddyAuth.StartOAuth(); })
+                .ContinueWith(t =>
+                {
+                    _wb.Busy = false;
+                    WbAuthData r = null;
+                    try { r = t.Result; }
+                    catch (Exception ex) { authError = ex.Message; }
+                    if (r != null)
+                    {
+                        _wb.LastResult = null;
+                        _tray.ShowBalloonTip(5000, "TraeSign", "WorkBuddy：授权成功，开始查询签到状态", ToolTipIcon.Info);
+                        LoadAccountsAsync();
+                    }
+                    else
+                    {
+                        string msg = string.IsNullOrEmpty(authError) ? "授权未完成或超时" : authError;
+                        _wb.LastResult = CheckinResult.Fail(-1, "授权失败：" + msg, WorkbuddyAuth.Platform);
+                        _tray.ShowBalloonTip(5000, "TraeSign", "WorkBuddy：授权失败 - " + msg, ToolTipIcon.Warning);
+                        UpdateTray();
+                        RefreshView();
+                    }
+                }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         public void ExitApp()
@@ -324,6 +455,13 @@ namespace TraeSign
             _tray = null;
             ExitThread();
         }
+    }
+
+    // 两平台账号列表装载结果
+    internal class TwoLists
+    {
+        public List<AccountInfo> Trae;
+        public List<AccountInfo> Wb;
     }
 
     // ============ 签到引擎（内置，无外部依赖） ============
@@ -338,6 +476,7 @@ namespace TraeSign
         public int? Extra;
         public string Message;
         public string Brand;
+        public string Platform;      // 所属平台："Trae" / "WorkBuddy"
 
         public static CheckinResult Fail(int code, string message, string brand)
         {
@@ -468,33 +607,64 @@ namespace TraeSign
         }
     }
 
-    // HTTP POST JSON（直连，证书失败降级重试一次）
+    // HTTP 响应（含状态码，供 WorkBuddy 引擎区分 401 与业务错误）
+    internal class ApiResp
+    {
+        public int Status;      // HTTP 状态码；0=无响应（网络异常）
+        public string Body;
+        public string Error;
+
+        public bool Ok { get { return Status >= 200 && Status < 300; } }
+    }
+
+    // HTTP POST/GET JSON（直连，证书失败降级重试一次）
     internal static class HttpApi
     {
         public static string PostJson(string url, Dictionary<string, string> headers, string bodyJson)
         {
-            return PostCore(url, headers, bodyJson, false);
+            ApiResp r = SendCore(url, "POST", headers, bodyJson, false);
+            if (r.Status == 0) throw new WebException(r.Error ?? "网络异常");
+            return r.Body;
         }
 
-        private static string PostCore(string url, Dictionary<string, string> headers, string bodyJson, bool insecure)
+        public static ApiResp PostWithStatus(string url, Dictionary<string, string> headers, string bodyJson)
+        {
+            return SendCore(url, "POST", headers, bodyJson, false);
+        }
+
+        public static ApiResp GetWithStatus(string url, Dictionary<string, string> headers)
+        {
+            return SendCore(url, "GET", headers, null, false);
+        }
+
+        private static ApiResp SendCore(string url, string method, Dictionary<string, string> headers, string bodyJson, bool insecure)
         {
             var req = (HttpWebRequest)WebRequest.Create(url);
-            req.Method = "POST";
-            req.ContentType = "application/json";
+            req.Method = method;
             req.Timeout = 60000;
             req.ReadWriteTimeout = 60000;
             req.Proxy = null;   // 直连，与 Node https 行为一致
             if (insecure) req.ServerCertificateValidationCallback = delegate { return true; };
             if (headers != null)
                 foreach (var kv in headers) req.Headers[kv.Key] = kv.Value;
-            byte[] payload = Encoding.UTF8.GetBytes(bodyJson ?? "{}");
-            req.ContentLength = payload.Length;
-            using (var s = req.GetRequestStream()) s.Write(payload, 0, payload.Length);
+            if (method == "POST")
+            {
+                req.ContentType = "application/json";
+                byte[] payload = Encoding.UTF8.GetBytes(bodyJson ?? "{}");
+                req.ContentLength = payload.Length;
+                using (var s = req.GetRequestStream()) s.Write(payload, 0, payload.Length);
+            }
             try
             {
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 using (var rs = resp.GetResponseStream())
-                using (var sr = new StreamReader(rs, Encoding.UTF8)) return sr.ReadToEnd();
+                using (var sr = new StreamReader(rs, Encoding.UTF8))
+                {
+                    var ok = new ApiResp();
+                    ok.Status = (int)resp.StatusCode;
+                    ok.Body = sr.ReadToEnd();
+                    return ok;
+                }
             }
             catch (WebException ex)
             {
@@ -502,14 +672,21 @@ namespace TraeSign
                 {
                     try
                     {
-                        using (var rs = ex.Response.GetResponseStream())
-                        using (var sr = new StreamReader(rs, Encoding.UTF8)) return sr.ReadToEnd();
+                        var hr = (HttpWebResponse)ex.Response;
+                        var fail = new ApiResp();
+                        fail.Status = (int)hr.StatusCode;
+                        using (var rs = hr.GetResponseStream())
+                        using (var sr = new StreamReader(rs, Encoding.UTF8)) fail.Body = sr.ReadToEnd();
+                        return fail;
                     }
                     catch { }
                 }
                 if (!insecure && ex.Status == WebExceptionStatus.SecureChannelFailure)
-                    return PostCore(url, headers, bodyJson, true);
-                throw;
+                    return SendCore(url, method, headers, bodyJson, true);
+                var err = new ApiResp();
+                err.Status = 0;
+                err.Error = ex.Message;
+                return err;
             }
         }
     }
@@ -625,6 +802,598 @@ namespace TraeSign
             return null;
         }
     }
+
+    // ============ JSON 工具（WorkBuddy 引擎用，兼容 camelCase/snake_case） ============
+    internal static class JsonUtil
+    {
+        public static Dictionary<string, object> ParseJson(string json)
+        {
+            try { return new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json); }
+            catch { return new Dictionary<string, object>(); }
+        }
+
+        public static Dictionary<string, object> GetDict(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v)) return v as Dictionary<string, object>;
+            return null;
+        }
+
+        public static string GetString(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null) return v.ToString();
+            return null;
+        }
+
+        public static string GetStringAny(Dictionary<string, object> d, params string[] keys)
+        {
+            if (d == null) return null;
+            foreach (string k in keys)
+            {
+                string v = GetString(d, k);
+                if (v != null) return v;
+            }
+            return null;
+        }
+
+        public static int GetInt(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null)
+            {
+                try { return Convert.ToInt32(v); } catch { }
+            }
+            return -1;
+        }
+
+        public static int? NullInt(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null && !(v is string))
+            {
+                try { return Convert.ToInt32(v); } catch { }
+            }
+            return null;
+        }
+
+        public static int? GetIntAny(Dictionary<string, object> d, params string[] keys)
+        {
+            if (d == null) return null;
+            foreach (string k in keys)
+            {
+                int? v = NullInt(d, k);
+                if (v.HasValue) return v;
+            }
+            return null;
+        }
+
+        public static long GetLong(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null)
+            {
+                try { return Convert.ToInt64(v); } catch { }
+            }
+            return 0;
+        }
+
+        public static bool GetBool(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null)
+            {
+                if (v is bool) return (bool)v;
+                try { return Convert.ToBoolean(v); } catch { }
+            }
+            return false;
+        }
+
+        public static bool GetBoolAny(Dictionary<string, object> d, params string[] keys)
+        {
+            if (d == null) return false;
+            foreach (string k in keys)
+                if (d.ContainsKey(k)) return GetBool(d, k);
+            return false;
+        }
+    }
+
+    // ============ WorkBuddy 凭证（客户端文件明文兼容 + OAuth 插件授权流 + DPAPI token 库） ============
+    internal class WbAuthData
+    {
+        public string Uid;              // account.uid（明文）或 JWT sub
+        public string AccessToken;      // 明文 JWT；加密信封时为 null
+        public string RefreshToken;     // 仅程序自有 token 库提供
+        public long ExpiresAt;          // ms epoch；0=未知
+        public long RefreshExpiresAt;   // ms epoch；0=未知
+        public string Domain;           // 如 www.workbuddy.cn
+        public bool FromStore;          // 是否来自程序自有 token 库
+    }
+
+    internal static class WorkbuddyAuth
+    {
+        public const string Platform = "WorkBuddy";
+        public const string DefaultDomain = "https://www.workbuddy.cn";
+        public static readonly string[] Domains = { "https://www.workbuddy.cn", "https://www.codebuddy.cn" };
+        public const string StatePath = "/v2/plugin/auth/state?platform=workbuddy";
+        public const string TokenPath = "/v2/plugin/auth/token?state=";
+        public const string RefreshUrl = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
+        private static readonly string[] AuthFiles = { "workbuddy-desktop.info", "workbuddy-desktop-ai.info", "workbuddy-desktop-dev.info" };
+
+        public static string TokenStorePath { get { return Path.Combine(HistoryStore.DataDir, "workbuddy_token.json"); } }
+
+        // ---------- 本机客户端登录态 ----------
+        public static WbAuthData ReadClientFile()
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CodeBuddyExtension", "Data", "Public", "auth");
+            foreach (string name in AuthFiles)
+            {
+                var a = ReadAuthFile(Path.Combine(dir, name));
+                if (a != null) return a;
+            }
+            return null;
+        }
+
+        private static WbAuthData ReadAuthFile(string file)
+        {
+            try
+            {
+                if (!File.Exists(file)) return null;
+                string text = File.ReadAllText(file, Encoding.UTF8);
+                var s = JsonUtil.ParseJson(text);
+                if (s == null || s.Count == 0) return null;
+                var auth = new WbAuthData();
+                object v;
+                object accObj;
+                if (s.TryGetValue("account", out accObj))
+                {
+                    var acc = accObj as Dictionary<string, object>;
+                    if (acc != null && acc.TryGetValue("uid", out v)) auth.Uid = v as string;
+                }
+                if (!s.TryGetValue("auth", out accObj)) return string.IsNullOrEmpty(auth.Uid) ? null : auth;
+                var ad = accObj as Dictionary<string, object>;
+                if (ad == null) return string.IsNullOrEmpty(auth.Uid) ? null : auth;
+
+                object at;
+                if (ad.TryGetValue("accessToken", out at) && at is string)
+                    auth.AccessToken = (string)at;   // 明文 JWT；$wbEncrypted 信封时保持 null（密钥在客户端进程内，无法离线解密）
+                // 注意：不读取客户端文件的 refreshToken——滚动轮换会让客户端持有的旧 token 失效导致其掉线；
+                // 程序的自动续期只使用自有 token 库（OAuth 授权所得）的 refreshToken
+                if (ad.TryGetValue("domain", out v) && v is string && !string.IsNullOrEmpty((string)v))
+                    auth.Domain = (string)v;
+                auth.ExpiresAt = JsonUtil.GetLong(ad, "expiresAt");
+                auth.RefreshExpiresAt = JsonUtil.GetLong(ad, "refreshExpiresAt");
+                return auth;
+            }
+            catch { return null; }
+        }
+
+        // $wbEncrypted 加密信封判定
+        public static bool IsEncryptedEnvelope(object v)
+        {
+            var d = v as Dictionary<string, object>;
+            if (d == null) return false;
+            object flag;
+            if (!d.TryGetValue("$wbEncrypted", out flag) || flag == null) return false;
+            try { return Convert.ToInt32(flag) == 1; } catch { return false; }
+        }
+
+        // ---------- JWT / Base64Url ----------
+        public static string JwtSub(string jwt)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(jwt)) return null;
+                string[] parts = jwt.Split('.');
+                if (parts.Length < 2) return null;
+                string json = Base64UrlDecode(parts[1]);
+                var d = JsonUtil.ParseJson(json);
+                if (d == null) return null;
+                object v;
+                if (d.TryGetValue("sub", out v)) return v == null ? null : v.ToString();
+                return null;
+            }
+            catch { return null; }
+        }
+
+        public static string Base64UrlDecode(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            string t = s.Replace('-', '+').Replace('_', '/');
+            int pad = (4 - t.Length % 4) % 4;
+            if (pad > 0) t = t + new string('=', pad);
+            return Encoding.UTF8.GetString(Convert.FromBase64String(t));
+        }
+
+        public static string Base64UrlEncode(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(s)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        public static bool IsExpired(long expiresAtMs)
+        {
+            if (expiresAtMs <= 0) return false;
+            return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() >= expiresAtMs;
+        }
+
+        // ---------- 程序自有 token 库（DPAPI CurrentUser 加密落盘） ----------
+        internal class WbTokenStoreDto
+        {
+            public int v;
+            public string uid;
+            public string at;   // DPAPI base64(accessToken)
+            public string rt;   // DPAPI base64(refreshToken)
+            public long expiresAt;
+            public long refreshExpiresAt;
+            public long savedAt;
+        }
+
+        public static WbAuthData LoadStore()
+        {
+            try
+            {
+                if (!File.Exists(TokenStorePath)) return null;
+                var dto = new JavaScriptSerializer().Deserialize<WbTokenStoreDto>(File.ReadAllText(TokenStorePath, Encoding.UTF8));
+                if (dto == null || string.IsNullOrEmpty(dto.at)) return null;
+                var a = new WbAuthData();
+                a.FromStore = true;
+                a.Uid = dto.uid;
+                a.AccessToken = DpapiUnprotect(dto.at);
+                a.RefreshToken = string.IsNullOrEmpty(dto.rt) ? null : DpapiUnprotect(dto.rt);
+                a.ExpiresAt = dto.expiresAt;
+                a.RefreshExpiresAt = dto.refreshExpiresAt;
+                if (string.IsNullOrEmpty(a.AccessToken)) return null;
+                return a;
+            }
+            catch { return null; }
+        }
+
+        public static void SaveStore(WbAuthData a)
+        {
+            if (a == null || string.IsNullOrEmpty(a.AccessToken)) return;
+            try
+            {
+                var dto = new WbTokenStoreDto();
+                dto.v = 1;
+                dto.uid = a.Uid;
+                dto.at = DpapiProtect(a.AccessToken);
+                dto.rt = string.IsNullOrEmpty(a.RefreshToken) ? null : DpapiProtect(a.RefreshToken);
+                dto.expiresAt = a.ExpiresAt;
+                dto.refreshExpiresAt = a.RefreshExpiresAt;
+                dto.savedAt = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+                string json = new JavaScriptSerializer().Serialize(dto);
+                if (!Directory.Exists(HistoryStore.DataDir)) Directory.CreateDirectory(HistoryStore.DataDir);
+                string tmp = TokenStorePath + ".tmp";
+                File.WriteAllText(tmp, json, new UTF8Encoding(false));
+                if (File.Exists(TokenStorePath)) File.Replace(tmp, TokenStorePath, null);
+                else File.Move(tmp, TokenStorePath);
+            }
+            catch { }
+        }
+
+        private static string DpapiProtect(string plain)
+        {
+            byte[] enc = System.Security.Cryptography.ProtectedData.Protect(
+                Encoding.UTF8.GetBytes(plain ?? ""), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(enc);
+        }
+
+        private static string DpapiUnprotect(string b64)
+        {
+            try
+            {
+                byte[] dec = System.Security.Cryptography.ProtectedData.Unprotect(
+                    Convert.FromBase64String(b64 ?? ""), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(dec);
+            }
+            catch { return null; }
+        }
+
+        // ---------- 取可用 token：客户端明文 → token 库（过期自动续期） ----------
+        public static WbAuthData GetWorkingToken()
+        {
+            WbAuthData file = ReadClientFile();
+            if (file != null && !string.IsNullOrEmpty(file.AccessToken) && !IsExpired(file.ExpiresAt)) return file;
+
+            WbAuthData store = LoadStore();
+            if (store != null && !string.IsNullOrEmpty(store.AccessToken))
+            {
+                if (!IsExpired(store.ExpiresAt)) return store;
+                if (!string.IsNullOrEmpty(store.RefreshToken) && !IsExpired(store.RefreshExpiresAt))
+                {
+                    WbAuthData nr = TryRefresh(store);
+                    if (nr != null) return nr;
+                }
+            }
+            return null;
+        }
+
+        // refreshToken 滚动轮换：刷新成功立即回写落盘
+        public static WbAuthData TryRefresh(WbAuthData current)
+        {
+            if (current == null || string.IsNullOrEmpty(current.RefreshToken)) return null;
+            try
+            {
+                var headers = new Dictionary<string, string>();
+                headers["X-Refresh-Token"] = current.RefreshToken;
+                headers["X-Auth-Refresh-Source"] = "plugin";
+                if (!string.IsNullOrEmpty(current.AccessToken)) headers["Authorization"] = "Bearer " + current.AccessToken;
+                if (!string.IsNullOrEmpty(current.Uid)) headers["X-User-Id"] = current.Uid;
+                ApiResp resp = HttpApi.PostWithStatus(RefreshUrl, headers, "{}");
+                if (resp.Status == 0) return null;
+                var d = JsonUtil.ParseJson(resp.Body);
+                if (JsonUtil.GetInt(d, "code") != 0) return null;
+                var data = JsonUtil.GetDict(d, "data");
+                if (data == null) return null;
+                string at = JsonUtil.GetStringAny(data, "accessToken", "access_token");
+                if (string.IsNullOrEmpty(at)) return null;
+                string rt = JsonUtil.GetStringAny(data, "refreshToken", "refresh_token");
+
+                var nr = new WbAuthData();
+                nr.FromStore = true;
+                nr.Uid = current.Uid ?? JwtSub(at);
+                nr.AccessToken = at;
+                nr.RefreshToken = string.IsNullOrEmpty(rt) ? current.RefreshToken : rt;
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                long expiresIn = JsonUtil.GetLong(data, "expiresIn");
+                long refreshExpiresIn = JsonUtil.GetLong(data, "refreshExpiresIn");
+                nr.ExpiresAt = expiresIn > 0 ? now + expiresIn * 1000 : 0;
+                nr.RefreshExpiresAt = refreshExpiresIn > 0 ? now + refreshExpiresIn * 1000 : current.RefreshExpiresAt;
+                SaveStore(nr);
+                return nr;
+            }
+            catch { return null; }
+        }
+
+        // ---------- OAuth 插件授权流（一次性，浏览器确认） ----------
+        public static WbAuthData StartOAuth()
+        {
+            // 1. 申请 state
+            ApiResp resp = HttpApi.PostWithStatus(DefaultDomain + StatePath, null, "{}");
+            if (resp.Status == 0) throw new Exception("网络异常：" + (resp.Error ?? ""));
+            var d = JsonUtil.ParseJson(resp.Body);
+            var data = JsonUtil.GetDict(d, "data");
+            string state = data != null ? JsonUtil.GetString(data, "state") : null;
+            string authUrl = data != null ? JsonUtil.GetString(data, "authUrl") : null;
+            if (string.IsNullOrEmpty(state) || string.IsNullOrEmpty(authUrl))
+                throw new Exception("授权服务响应异常（HTTP " + resp.Status + "）");
+
+            // 2. 打开浏览器（失败不中断，用户可手动复制链接）
+            try { Process.Start(authUrl); } catch { }
+
+            // 3. 轮询换 token（最长约 3 分钟）
+            for (int i = 0; i < 60; i++)
+            {
+                Thread.Sleep(3000);
+                ApiResp tr = HttpApi.GetWithStatus(DefaultDomain + TokenPath + Uri.EscapeDataString(state), null);
+                if (tr.Status == 0) continue;
+                var td = JsonUtil.ParseJson(tr.Body);
+                int code = JsonUtil.GetInt(td, "code");
+                if (code == 11217) continue;   // 等待用户在浏览器确认
+                if (code != 0)
+                    throw new Exception("授权失败(" + code + ")：" + (JsonUtil.GetStringAny(td, "msg", "message") ?? ""));
+                var tdata = JsonUtil.GetDict(td, "data");
+                if (tdata == null) continue;
+                string at = JsonUtil.GetStringAny(tdata, "accessToken", "access_token");
+                if (string.IsNullOrEmpty(at))
+                {
+                    var nested = JsonUtil.GetDict(tdata, "auth");
+                    if (nested == null) nested = JsonUtil.GetDict(tdata, "token");
+                    if (nested != null) at = JsonUtil.GetStringAny(nested, "accessToken", "access_token");
+                }
+                if (string.IsNullOrEmpty(at)) continue;
+
+                string rt = JsonUtil.GetStringAny(tdata, "refreshToken", "refresh_token");
+                if (string.IsNullOrEmpty(rt))
+                {
+                    var nested = JsonUtil.GetDict(tdata, "auth");
+                    if (nested != null) rt = JsonUtil.GetStringAny(nested, "refreshToken", "refresh_token");
+                }
+                var a = new WbAuthData();
+                a.FromStore = true;
+                a.AccessToken = at;
+                a.RefreshToken = rt;
+                a.Uid = JsonUtil.GetStringAny(tdata, "uid", "userId") ?? JwtSub(at);
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                long expiresIn = JsonUtil.GetLong(tdata, "expiresIn");
+                long refreshExpiresIn = JsonUtil.GetLong(tdata, "refreshExpiresIn");
+                a.ExpiresAt = expiresIn > 0 ? now + expiresIn * 1000 : 0;
+                a.RefreshExpiresAt = refreshExpiresIn > 0 ? now + refreshExpiresIn * 1000 : 0;
+                SaveStore(a);
+                return a;
+            }
+            throw new Exception("授权超时：未在 3 分钟内完成浏览器确认");
+        }
+
+        // ---------- 账号列表（供 UI/调度） ----------
+        public static List<AccountInfo> ListAccounts()
+        {
+            var list = new List<AccountInfo>();
+            WbAuthData file = ReadClientFile();
+            WbAuthData store = LoadStore();
+            string uid = null;
+            long exp = 0;
+            if (file != null && !string.IsNullOrEmpty(file.Uid)) { uid = file.Uid; exp = file.ExpiresAt; }
+            if (uid == null && store != null && !string.IsNullOrEmpty(store.Uid)) { uid = store.Uid; exp = store.ExpiresAt; }
+            bool hasToken = GetWorkingToken() != null;
+            if (uid == null && !hasToken) return list;
+            var info = new AccountInfo();
+            info.Brand = Platform;
+            info.Username = string.IsNullOrEmpty(uid) ? null : uid;
+            info.ExpiredAt = exp > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(exp).LocalDateTime.ToString("yyyy-MM-dd HH:mm") : null;
+            info.HasToken = hasToken;
+            list.Add(info);
+            return list;
+        }
+    }
+
+    // ============ WorkBuddy 签到引擎 ============
+    internal static class WorkbuddyRunner
+    {
+        private const string StatusPath = "/v2/billing/meter/checkin-activity-status";
+        private const string ClaimPath = "/v2/billing/meter/daily-checkin";
+
+        public static CheckinResult Run(bool queryOnly)
+        {
+            WbAuthData auth = WorkbuddyAuth.GetWorkingToken();
+            if (auth == null || string.IsNullOrEmpty(auth.AccessToken))
+                return CheckinResult.Fail(-1, "未授权：请在 WorkBuddy 页签点击“登录授权”完成一次浏览器登录", WorkbuddyAuth.Platform);
+
+            try
+            {
+                // 1. 状态查询（401/过期 → 自动续期重试一次）
+                ApiResp st = PostWithAuthRefresh(auth, StatusPath);
+                if (st == null)
+                    return CheckinResult.Fail(-3, "网络异常：主备域名均不可达", WorkbuddyAuth.Platform);
+                var status = JsonUtil.ParseJson(st.Body);
+                int code = JsonUtil.GetInt(status, "code");
+                if (st.Status == 401 || IsAuthCode(code))
+                    return CheckinResult.Fail(-6, "登录已失效且自动续期失败，请重新授权", WorkbuddyAuth.Platform);
+                if (code != 0)
+                    return CheckinResult.Fail(code, JsonUtil.GetStringAny(status, "msg", "message") ?? "状态查询失败", WorkbuddyAuth.Platform);
+                var data = JsonUtil.GetDict(status, "data");
+                if (data == null)
+                    return CheckinResult.Fail(-6, "状态响应异常（可能未授权或接口已变化）", WorkbuddyAuth.Platform);
+
+                bool checkedIn = JsonUtil.GetBoolAny(data, "todayCheckedIn", "today_checked_in");
+                int? todayCredit = JsonUtil.GetIntAny(data, "todayCredit", "today_credit", "dailyCredit", "daily_credit");
+
+                if (queryOnly)
+                    return new CheckinResult
+                    {
+                        Success = checkedIn,
+                        Code = 0,
+                        CheckedIn = checkedIn,
+                        Already = checkedIn,
+                        Username = auth.Uid,
+                        Base = todayCredit,
+                        Extra = null,
+                        Message = checkedIn ? "今日已签到" : "今日未签到",
+                        Brand = WorkbuddyAuth.Platform
+                    };
+
+                if (checkedIn)
+                    return new CheckinResult
+                    {
+                        Success = true,
+                        Code = 0,
+                        CheckedIn = true,
+                        Already = true,
+                        Username = auth.Uid,
+                        Base = todayCredit,
+                        Extra = null,
+                        Message = "今日已签到",
+                        Brand = WorkbuddyAuth.Platform
+                    };
+
+                // 2. 领取
+                ApiResp cl = PostWithAuthRefresh(auth, ClaimPath);
+                if (cl == null)
+                    return CheckinResult.Fail(-3, "网络异常：主备域名均不可达", WorkbuddyAuth.Platform);
+                var claim = JsonUtil.ParseJson(cl.Body);
+                int ccode = JsonUtil.GetInt(claim, "code");
+                string cmsg = JsonUtil.GetStringAny(claim, "msg", "message");
+                if (cl.Status == 401 || IsAuthCode(ccode))
+                    return CheckinResult.Fail(-6, "登录已失效且自动续期失败，请重新授权", WorkbuddyAuth.Platform);
+
+                if (ccode == 0 || ccode == 10001 || (cmsg != null && cmsg.Contains("已签到")))
+                {
+                    // 3. 二次确认（防假成功，与 Trae 同口径）
+                    var cdata = JsonUtil.GetDict(claim, "data");
+                    int? credit = cdata != null ? JsonUtil.GetIntAny(cdata, "credit", "todayCredit", "today_credit") : null;
+                    ApiResp cf = PostAny(BuildHeaders(auth), StatusPath);
+                    var confirm = cf != null && cf.Ok ? JsonUtil.ParseJson(cf.Body) : null;
+                    var cdata2 = confirm != null && JsonUtil.GetInt(confirm, "code") == 0 ? JsonUtil.GetDict(confirm, "data") : null;
+                    bool confirmed = cdata2 != null && JsonUtil.GetBoolAny(cdata2, "todayCheckedIn", "today_checked_in");
+                    if (!confirmed && ccode != 10001)
+                        return CheckinResult.Fail(-6, "签到结果异常（未确认到已签到状态）", WorkbuddyAuth.Platform);
+                    int? todayCredit2 = cdata2 != null ? JsonUtil.GetIntAny(cdata2, "todayCredit", "today_credit", "dailyCredit", "daily_credit") : null;
+                    int? finalCredit = credit.HasValue ? credit : (todayCredit2.HasValue ? todayCredit2 : todayCredit);
+                    bool already = ccode == 10001;
+                    return new CheckinResult
+                    {
+                        Success = true,
+                        Code = 0,
+                        CheckedIn = true,
+                        Already = already,
+                        Username = auth.Uid,
+                        Base = finalCredit,
+                        Extra = null,
+                        Message = already ? "今日已签到" : "签到成功",
+                        Brand = WorkbuddyAuth.Platform
+                    };
+                }
+                if (ccode == 41000)
+                    return CheckinResult.Fail(41000, "签到活动未开始或已结束", WorkbuddyAuth.Platform);
+                return CheckinResult.Fail(ccode, cmsg ?? "签到失败", WorkbuddyAuth.Platform);
+            }
+            catch (Exception ex)
+            {
+                return CheckinResult.Fail(-3, "网络异常: " + ex.Message, WorkbuddyAuth.Platform);
+            }
+        }
+
+        private static Dictionary<string, string> BuildHeaders(WbAuthData auth)
+        {
+            var headers = new Dictionary<string, string>();
+            headers["Authorization"] = "Bearer " + auth.AccessToken;
+            if (!string.IsNullOrEmpty(auth.Uid)) headers["X-User-Id"] = auth.Uid;
+            return headers;
+        }
+
+        // 主备域名回退：主域名无响应时切备用
+        private static ApiResp PostAny(Dictionary<string, string> headers, string path)
+        {
+            ApiResp last = null;
+            foreach (string dom in WorkbuddyAuth.Domains)
+            {
+                var h = new Dictionary<string, string>(headers);
+                h["X-Domain"] = dom.Replace("https://", "");
+                ApiResp r = HttpApi.PostWithStatus(dom + path, h, "{}");
+                if (r.Status != 0) return r;
+                last = r;
+            }
+            return last;
+        }
+
+        // 401/token 失效 → 续期一次后重试（结果回写 token 库）
+        private static ApiResp PostWithAuthRefresh(WbAuthData auth, string path)
+        {
+            ApiResp r = PostAny(BuildHeaders(auth), path);
+            if (r != null && r.Status != 401 && !BodyHasAuthCode(r)) return r;
+
+            WbAuthData nr = null;
+            if (!string.IsNullOrEmpty(auth.RefreshToken)) nr = WorkbuddyAuth.TryRefresh(auth);
+            if (nr == null)
+            {
+                // 客户端文件里的明文 token 可能已被客户端自己刷新 → 重读一次
+                var file = WorkbuddyAuth.ReadClientFile();
+                if (file == null || string.IsNullOrEmpty(file.AccessToken) || file.AccessToken == auth.AccessToken) return r;
+                auth.AccessToken = file.AccessToken;
+            }
+            else
+            {
+                auth.AccessToken = nr.AccessToken;
+                auth.RefreshToken = nr.RefreshToken;
+            }
+            return PostAny(BuildHeaders(auth), path);
+        }
+
+        private static bool BodyHasAuthCode(ApiResp r)
+        {
+            if (r == null || string.IsNullOrEmpty(r.Body)) return false;
+            int code = JsonUtil.GetInt(JsonUtil.ParseJson(r.Body), "code");
+            return IsAuthCode(code);
+        }
+
+        private static bool IsAuthCode(int code)
+        {
+            return code == 401 || code == 40100 || code == 12153;
+        }
+    }
+
     // ============ 历史记录 ============
     internal class HistoryEntry
     {
@@ -801,7 +1570,7 @@ namespace TraeSign
         }
     }
 
-    // ============ 每日调度 ============
+    // ============ 每日调度（每平台独立一份） ============
     internal class DailyScheduler
     {
         private static readonly TimeSpan Target = new TimeSpan(0, 5, 0);
@@ -809,13 +1578,15 @@ namespace TraeSign
 
         private System.Windows.Forms.Timer _timer;
         private TrayApp _app;
+        private readonly string _platform;
         private DateTime? _lastAttemptDate;
         private DateTime? _nextRetryAt;
         private int _retryCount;
 
-        public DailyScheduler(TrayApp app)
+        public DailyScheduler(TrayApp app, string platform)
         {
             _app = app;
+            _platform = platform;
             _lastAttemptDate = null;
             _nextRetryAt = null;
             _retryCount = 0;
@@ -889,17 +1660,19 @@ namespace TraeSign
             var now = DateTime.Now;
             if (now.Hour >= 23) return;                     // 当天放弃
             if (!ShouldCheckinNow(now, _lastAttemptDate, _nextRetryAt, Target)) return;
-            _app.RunCheckinAsync(false, _app.ActiveBrand);
+            _app.RunCheckinAsync(false, _platform, null);
         }
     }
 
-    // ============ 主窗口 ============
-    internal class MainForm : Form
+    // ============ 单平台面板（Trae / WorkBuddy 复用） ============
+    internal class PlatformPanel : UserControl
     {
-        private TrayApp _app;
-        private Label _titleStatus;
+        private readonly TrayApp _app;
+        public readonly string Platform;
+
         private ComboBox _accountCombo;
         private Button _refreshBtn;
+        private Button _authBtn;
         private Label _accountDetailLabel;
         private Label _todayStatusLabel;
         private Label _creditsLabel;
@@ -911,39 +1684,13 @@ namespace TraeSign
         private CalendarControl _calendar;
         private bool _changingCombo;
 
-        public MainForm(TrayApp app)
+        public PlatformPanel(TrayApp app, string platform)
         {
             _app = app;
+            Platform = platform;
             _changingCombo = false;
-            Text = "TraeSign - 每日签到";
-            Width = 460;
-            Height = 680;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            StartPosition = FormStartPosition.CenterScreen;
-            ShowInTaskbar = true;
+            Dock = DockStyle.Fill;
             Font = new Font("Microsoft YaHei UI", 9f);
-
-            // ---- 标题行 ----
-            var titlePanel = new Panel();
-            titlePanel.Dock = DockStyle.Top;
-            titlePanel.Height = 46;
-            titlePanel.Padding = new Padding(12, 10, 12, 4);
-
-            var titleLabel = new Label();
-            titleLabel.Text = "TraeSign";
-            titleLabel.Font = new Font(this.Font.FontFamily, 13f, FontStyle.Bold);
-            titleLabel.AutoSize = true;
-            titleLabel.Location = new Point(12, 12);
-
-            _titleStatus = new Label();
-            _titleStatus.Text = "状态：--";
-            _titleStatus.AutoSize = true;
-            _titleStatus.Location = new Point(330, 16);
-            _titleStatus.ForeColor = Color.Gray;
-
-            titlePanel.Controls.Add(titleLabel);
-            titlePanel.Controls.Add(_titleStatus);
 
             // ---- 账号区 ----
             var accGroup = new GroupBox();
@@ -959,19 +1706,30 @@ namespace TraeSign
             _accountCombo.SelectedIndexChanged += delegate { OnAccountChanged(); };
 
             _refreshBtn = new Button();
-            _refreshBtn.Text = "刷新账号状态";
+            _refreshBtn.Text = platform == "WorkBuddy" ? "刷新状态" : "刷新账号状态";
             _refreshBtn.Location = new Point(330, 21);
             _refreshBtn.Size = new Size(84, 25);
             _refreshBtn.Click += delegate { _app.RefreshAccountsAndStatus(); };
 
+            _authBtn = new Button();
+            _authBtn.Text = "登录授权";
+            _authBtn.Location = new Point(330, 50);
+            _authBtn.Size = new Size(84, 25);
+            _authBtn.Visible = (platform == "WorkBuddy");
+            _authBtn.Click += delegate { _app.StartWorkbuddyAuthAsync(); };
+
             _accountDetailLabel = new Label();
             _accountDetailLabel.Location = new Point(14, 52);
             _accountDetailLabel.AutoSize = false;
-            _accountDetailLabel.Width = 400;
-            _accountDetailLabel.Text = "未找到登录态，请先运行 Trae 桌面端登录";
+            _accountDetailLabel.Height = 40;
+            _accountDetailLabel.Width = platform == "WorkBuddy" ? 310 : 400;
+            _accountDetailLabel.Text = platform == "WorkBuddy"
+                ? "未授权：点击“登录授权”完成一次浏览器登录"
+                : "未找到登录态，请先运行 Trae 桌面端登录";
 
             accGroup.Controls.Add(_accountCombo);
             accGroup.Controls.Add(_refreshBtn);
+            accGroup.Controls.Add(_authBtn);
             accGroup.Controls.Add(_accountDetailLabel);
 
             // ---- 今日签到区 ----
@@ -1019,7 +1777,7 @@ namespace TraeSign
             _autoNoteLabel.AutoSize = false;
             _autoNoteLabel.Height = 20;
             _autoNoteLabel.Width = 400;
-            _autoNoteLabel.Text = "每日 00:05 自动签到（仅当前选中账号）";
+            _autoNoteLabel.Text = "每日 00:05 自动签到（" + platform + "）";
 
             _retryLabel = new Label();
             _retryLabel.Location = new Point(14, 52);
@@ -1033,7 +1791,7 @@ namespace TraeSign
             _checkinBtn.Text = "立即签到（手动）";
             _checkinBtn.Location = new Point(300, 48);
             _checkinBtn.Size = new Size(122, 32);
-            _checkinBtn.Click += delegate { _app.RunCheckinAsync(false, _app.ActiveBrand); };
+            _checkinBtn.Click += delegate { _app.RunCheckinAsync(false, Platform, null); };
 
             autoGroup.Controls.Add(_autoNoteLabel);
             autoGroup.Controls.Add(_retryLabel);
@@ -1055,20 +1813,21 @@ namespace TraeSign
             Controls.Add(autoGroup);
             Controls.Add(todayGroup);
             Controls.Add(accGroup);
-            Controls.Add(titlePanel);
 
-            RefreshAccounts(_app.Accounts);
+            RefreshAccounts();
         }
 
-        public void RefreshAccounts(List<AccountInfo> accounts)
+        public void RefreshAccounts()
         {
+            var slot = _app.Slot(Platform);
+            if (slot == null) return;
             _changingCombo = true;
             try
             {
                 _accountCombo.Items.Clear();
-                string active = _app.ActiveBrand;
+                string active = slot.ActiveBrand;
                 int idx = -1;
-                foreach (var a in accounts)
+                foreach (var a in slot.Accounts)
                 {
                     _accountCombo.Items.Add(a);
                     if (a.Brand == active) idx = _accountCombo.Items.Count - 1;
@@ -1076,6 +1835,7 @@ namespace TraeSign
                 if (idx >= 0) _accountCombo.SelectedIndex = idx;
                 else if (_accountCombo.Items.Count > 0) _accountCombo.SelectedIndex = 0;
                 _accountCombo.Enabled = _accountCombo.Items.Count > 1;
+                _authBtn.Visible = (Platform == "WorkBuddy");
             }
             finally { _changingCombo = false; }
         }
@@ -1084,72 +1844,82 @@ namespace TraeSign
         {
             if (_changingCombo) return;
             var sel = _accountCombo.SelectedItem as AccountInfo;
-            if (sel != null && _app.ActiveBrand != sel.Brand)
-                _app.SetActiveBrand(sel.Brand);
+            if (sel != null)
+            {
+                var slot = _app.Slot(Platform);
+                if (slot != null && slot.ActiveBrand != sel.Brand)
+                    _app.SetActiveBrand(Platform, sel.Brand);
+            }
             RefreshView();
         }
 
         public void RefreshView()
         {
-            string active = _app.ActiveBrand;
-            AccountInfo acc = null;
-            foreach (var a in _app.Accounts)
-                if (a.Brand == active) { acc = a; break; }
+            var slot = _app.Slot(Platform);
+            if (slot == null) return;
+            string active = slot.ActiveBrand;
+            AccountInfo acc = slot.ActiveAccount();
 
             if (acc == null)
             {
-                _titleStatus.Text = "状态：未登录";
-                _accountDetailLabel.Text = "未找到登录态，请先运行 Trae 桌面端登录";
+                _accountDetailLabel.Text = Platform == "WorkBuddy"
+                    ? "未找到 WorkBuddy 客户端登录态；可点击“登录授权”直接授权本程序"
+                    : "未找到登录态，请先运行 Trae 桌面端登录";
                 _todayStatusLabel.Text = "今日：--";
                 _creditsLabel.Text = "积分：--";
                 _occupiedLabel.Visible = false;
                 _calendarGroup.Text = "签到日历";
+                _calendar.SetData(new Dictionary<string, bool>());
                 return;
             }
 
-            _accountDetailLabel.Text = "软件：" + acc.Brand + "   登录名：" + (string.IsNullOrEmpty(acc.Username) ? "--" : acc.Username);
-            if (!string.IsNullOrEmpty(acc.ExpiredAt))
-                _accountDetailLabel.Text += "   Token 过期：" + FormatExpiry(acc.ExpiredAt);
-
-            var entry = HistoryStore.TodayEntry(active);
-            bool ok = entry != null && entry.success;
-            if (ok)
+            bool wbNoToken = (Platform == "WorkBuddy" && !acc.HasToken);
+            if (wbNoToken)
             {
-                _titleStatus.Text = "状态：已签到";
-                _titleStatus.ForeColor = Color.FromArgb(76, 175, 80);
-                _todayStatusLabel.Text = "今日：已签到";
-                if (entry.baseCredits.HasValue || entry.extra.HasValue)
-                    _creditsLabel.Text = "积分：+" + (entry.baseCredits.GetValueOrDefault(0) + entry.extra.GetValueOrDefault(0)) + "（基础" + entry.baseCredits + " 额外" + entry.extra + "）";
-                else
-                    _creditsLabel.Text = "积分：已领取";
-            }
-            else if (entry != null && entry.occupied)
-            {
-                _titleStatus.Text = "状态：已占用";
-                _titleStatus.ForeColor = Color.FromArgb(244, 67, 54);
-                _todayStatusLabel.Text = "今日：未签到（本机已被另一账号签到）";
-                _creditsLabel.Text = "积分：--";
-                _occupiedLabel.Visible = true;
-            }
-            else if (entry != null && entry.code == -6)
-            {
-                _titleStatus.Text = "状态：账号异常";
-                _titleStatus.ForeColor = Color.FromArgb(244, 67, 54);
-                _todayStatusLabel.Text = "今日：账号状态异常（token 可能已过期）";
+                _accountDetailLabel.Text = "未授权：点击“登录授权”完成一次浏览器登录，之后自动续期";
+                _todayStatusLabel.Text = "今日：待授权";
                 _creditsLabel.Text = "积分：--";
                 _occupiedLabel.Visible = false;
             }
             else
             {
-                _titleStatus.Text = "状态：未签到";
-                _titleStatus.ForeColor = Color.Gray;
-                _todayStatusLabel.Text = "今日：未签到";
-                _creditsLabel.Text = "积分：--";
-                _occupiedLabel.Visible = false;
+                _accountDetailLabel.Text = "软件：" + acc.Brand + "   登录名：" + (string.IsNullOrEmpty(acc.Username) ? "--" : acc.Username);
+                if (!string.IsNullOrEmpty(acc.ExpiredAt))
+                    _accountDetailLabel.Text += "   Token 过期：" + FormatExpiry(acc.ExpiredAt);
+
+                var entry = HistoryStore.TodayEntry(active);
+                bool ok = entry != null && entry.success;
+                if (ok)
+                {
+                    _todayStatusLabel.Text = "今日：已签到";
+                    if (entry.baseCredits.HasValue || entry.extra.HasValue)
+                        _creditsLabel.Text = "积分：+" + (entry.baseCredits.GetValueOrDefault(0) + entry.extra.GetValueOrDefault(0)) + "（基础" + entry.baseCredits + " 额外" + entry.extra + "）";
+                    else
+                        _creditsLabel.Text = "积分：已领取";
+                    _occupiedLabel.Visible = false;
+                }
+                else if (entry != null && entry.occupied)
+                {
+                    _todayStatusLabel.Text = "今日：未签到（本机已被另一账号签到）";
+                    _creditsLabel.Text = "积分：--";
+                    _occupiedLabel.Visible = true;
+                }
+                else if (entry != null && entry.code == -6)
+                {
+                    _todayStatusLabel.Text = "今日：" + (Platform == "WorkBuddy" ? "登录已失效，请重新授权" : "账号状态异常（token 可能已过期）");
+                    _creditsLabel.Text = "积分：--";
+                    _occupiedLabel.Visible = false;
+                }
+                else
+                {
+                    _todayStatusLabel.Text = "今日：未签到";
+                    _creditsLabel.Text = "积分：--";
+                    _occupiedLabel.Visible = false;
+                }
             }
 
-            _autoNoteLabel.Text = "每日 00:05 自动签到（当前选中账号：" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
-            var retry = _app.Scheduler.NextRetryAt;
+            _autoNoteLabel.Text = "每日 00:05 自动签到（" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
+            var retry = slot.Scheduler != null ? slot.Scheduler.NextRetryAt : null;
             _retryLabel.Text = retry.HasValue
                 ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm")
                 : "自动签到已开启，失败后自动重试";
@@ -1171,7 +1941,101 @@ namespace TraeSign
 
         private void RefreshCalendar()
         {
-            _calendar.SetData(HistoryStore.SuccessMap(_calendar.CurrentMonth.Year, _calendar.CurrentMonth.Month, _app.ActiveBrand));
+            var slot = _app.Slot(Platform);
+            string brand = (slot != null && !string.IsNullOrEmpty(slot.ActiveBrand)) ? slot.ActiveBrand : Platform;
+            _calendar.SetData(HistoryStore.SuccessMap(_calendar.CurrentMonth.Year, _calendar.CurrentMonth.Month, brand));
+        }
+    }
+
+    // ============ 主窗口（标题行 + 双平台 Tab） ============
+    internal class MainForm : Form
+    {
+        private readonly TrayApp _app;
+        private Label _titleStatus;
+        private TabControl _tabs;
+        private PlatformPanel _traePanel;
+        private PlatformPanel _wbPanel;
+
+        public MainForm(TrayApp app)
+        {
+            _app = app;
+            Text = "TraeSign - 每日签到";
+            Width = 460;
+            Height = 726;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            ShowInTaskbar = true;
+            Font = new Font("Microsoft YaHei UI", 9f);
+
+            // ---- 标题行 ----
+            var titlePanel = new Panel();
+            titlePanel.Dock = DockStyle.Top;
+            titlePanel.Height = 46;
+            titlePanel.Padding = new Padding(12, 10, 12, 4);
+
+            var titleLabel = new Label();
+            titleLabel.Text = "TraeSign";
+            titleLabel.Font = new Font(this.Font.FontFamily, 13f, FontStyle.Bold);
+            titleLabel.AutoSize = true;
+            titleLabel.Location = new Point(12, 12);
+
+            _titleStatus = new Label();
+            _titleStatus.Text = "状态：--";
+            _titleStatus.AutoSize = true;
+            _titleStatus.Location = new Point(320, 16);
+            _titleStatus.ForeColor = Color.Gray;
+
+            titlePanel.Controls.Add(titleLabel);
+            titlePanel.Controls.Add(_titleStatus);
+
+            // ---- 双平台 Tab ----
+            _tabs = new TabControl();
+            _tabs.Dock = DockStyle.Fill;
+
+            var tpTrae = new TabPage("Trae");
+            _traePanel = new PlatformPanel(app, "Trae");
+            tpTrae.Controls.Add(_traePanel);
+
+            var tpWb = new TabPage("WorkBuddy");
+            _wbPanel = new PlatformPanel(app, "WorkBuddy");
+            tpWb.Controls.Add(_wbPanel);
+
+            _tabs.TabPages.Add(tpTrae);
+            _tabs.TabPages.Add(tpWb);
+
+            Controls.Add(_tabs);
+            Controls.Add(titlePanel);
+        }
+
+        public void RefreshAccounts()
+        {
+            _traePanel.RefreshAccounts();
+            _wbPanel.RefreshAccounts();
+        }
+
+        public void RefreshView()
+        {
+            string tip;
+            TrayState st = _app.ComputeAggregateState(out tip);
+            if (st == TrayState.CheckedIn)
+            {
+                _titleStatus.Text = "状态：已签到";
+                _titleStatus.ForeColor = Color.FromArgb(76, 175, 80);
+            }
+            else if (st == TrayState.Failed)
+            {
+                _titleStatus.Text = "状态：有平台异常";
+                _titleStatus.ForeColor = Color.FromArgb(244, 67, 54);
+            }
+            else
+            {
+                _titleStatus.Text = "状态：进行中";
+                _titleStatus.ForeColor = Color.Gray;
+            }
+            _titleStatus.Tag = tip;
+            _traePanel.RefreshView();
+            _wbPanel.RefreshView();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1296,6 +2160,38 @@ namespace TraeSign
                 if (!string.IsNullOrEmpty(q.Username)) HistoryStore.SetUser(firstBrand, q.Username);
                 var c = CheckinRunner.Run(false, firstBrand);
                 Check("签到调用成功(code=" + c.Code + ", msg=" + c.Message + ")", c.Success || c.CheckedIn || c.Code == 9095 || c.Code == 9074);
+
+                // 8. WorkBuddy：信封判定 / JWT / 字段兼容 / token 库 DPAPI 往返
+                var encObj = JsonUtil.ParseJson("{\"$wbEncrypted\":1,\"envelope\":\"x\"}");
+                Check("WB 加密信封判定", WorkbuddyAuth.IsEncryptedEnvelope(encObj) == true);
+                Check("WB 明文非信封判定", WorkbuddyAuth.IsEncryptedEnvelope("eyJabc") == false);
+                string fakeJwt = WorkbuddyAuth.Base64UrlEncode("{\"alg\":\"none\"}") + "." + WorkbuddyAuth.Base64UrlEncode("{\"sub\":\"uid-12345\"}") + ".sig";
+                Check("WB JWT sub 解析", WorkbuddyAuth.JwtSub(fakeJwt) == "uid-12345");
+                var wbFields = JsonUtil.ParseJson("{\"todayCheckedIn\":true,\"streak_days\":3,\"todayCredit\":150}");
+                Check("WB camel/snake 兼容取值", JsonUtil.GetBoolAny(wbFields, "todayCheckedIn", "today_checked_in") == true
+                    && JsonUtil.GetIntAny(wbFields, "streakDays", "streak_days") == 3
+                    && JsonUtil.GetIntAny(wbFields, "today_credit", "todayCredit") == 150);
+                var tok = new WbAuthData();
+                tok.Uid = "t-uid"; tok.AccessToken = "at-selftest-token"; tok.RefreshToken = "rt-selftest"; tok.ExpiresAt = 0; tok.RefreshExpiresAt = 0;
+                WorkbuddyAuth.SaveStore(tok);
+                var tok2 = WorkbuddyAuth.LoadStore();
+                Check("WB token 库 DPAPI 往返", tok2 != null && tok2.AccessToken == "at-selftest-token" && tok2.RefreshToken == "rt-selftest" && tok2.Uid == "t-uid");
+
+                // 9. WorkBuddy：账号列表 + 真实查询（仅已有 token 时；未授权跳过网络测试）
+                var wbAccounts = WorkbuddyAuth.ListAccounts();
+                bool wbBrandOk = true;
+                foreach (var a in wbAccounts)
+                    if (a.Brand != WorkbuddyAuth.Platform) wbBrandOk = false;
+                Check("WB 账号列表合法(实际=" + wbAccounts.Count + ")", wbBrandOk);
+                if (WorkbuddyAuth.GetWorkingToken() != null)
+                {
+                    var wq = WorkbuddyRunner.Run(true);
+                    Check("WB 查询成功(code=" + wq.Code + ", msg=" + wq.Message + ")", wq.Code == 0 || wq.Code == -6);
+                }
+                else
+                {
+                    sb.AppendLine("[SKIP] WB 真实查询（未授权，跳过；完成一次浏览器授权后自测将覆盖）");
+                }
             }
             catch (Exception ex)
             {

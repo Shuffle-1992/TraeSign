@@ -331,7 +331,12 @@ namespace TraeSign
             _zc.Accounts = zc ?? new List<AccountInfo>();
             _zc.ActiveBrand = _zc.Accounts.Count > 0 ? ZcodeAuth.Platform : null;
 
-            if (_form != null && !_form.IsDisposed) _form.RefreshAccounts();
+            if (_form != null && !_form.IsDisposed)
+            {
+                _form.RefreshAccounts();
+                // 账号装载后立即刷新状态区，不等查询返回（避免"有账号但显示未找到"的中间态）
+                _form.RefreshView();
+            }
 
             if (_trae.Accounts.Count == 0 && _wb.Accounts.Count == 0 && _zc.Accounts.Count == 0)
             {
@@ -2757,9 +2762,9 @@ namespace TraeSign
             _retryLabel.Text = "";
 
             _checkinBtn = new Button();
-            _checkinBtn.Text = isZc ? "检查并领取（手动）" : "立即签到（手动）";
-            _checkinBtn.Location = new Point(300, 48);
-            _checkinBtn.Size = new Size(122, 32);
+            _checkinBtn.Text = isZc ? "检查并领取" : "立即签到（手动）";
+            _checkinBtn.Location = new Point(282, 48);
+            _checkinBtn.Size = new Size(140, 32);
             _checkinBtn.Click += delegate { _app.RunCheckinAsync(false, Platform, null); };
 
             autoGroup.Controls.Add(_autoNoteLabel);
@@ -2823,6 +2828,25 @@ namespace TraeSign
         }
 
         public void RefreshView()
+        {
+            // 单面板刷新异常要显式可见（写入详情区），避免静默停留旧状态且拖垮其他面板
+            try
+            {
+                RefreshViewCore();
+                _accountDetailLabel.ForeColor = Color.FromArgb(55, 55, 55);
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    _accountDetailLabel.ForeColor = Color.FromArgb(244, 67, 54);
+                    _accountDetailLabel.Text = "界面刷新异常：" + ex.Message;
+                }
+                catch { }
+            }
+        }
+
+        private void RefreshViewCore()
         {
             var slot = _app.Slot(Platform);
             if (slot == null) return;

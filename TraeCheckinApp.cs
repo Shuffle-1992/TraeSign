@@ -73,7 +73,30 @@ namespace TraeSign
         public override string ToString() { return Display; }
     }
 
-    // ============ 平台槽位（Trae / WorkBuddy 各一份） ============
+    // ============ 运行日志（诊断用，超 1MB 轮转保留一份旧文件） ============
+    internal static class RuntimeLog
+    {
+        private static readonly object Gate = new object();
+        public static string LogPath { get { return Path.Combine(HistoryStore.DataDir, "runtime.log"); } }
+
+        public static void Write(string line)
+        {
+            try
+            {
+                lock (Gate)
+                {
+                    if (!Directory.Exists(HistoryStore.DataDir)) Directory.CreateDirectory(HistoryStore.DataDir);
+                    if (File.Exists(LogPath) && new FileInfo(LogPath).Length > 1024 * 1024)
+                        File.Replace(LogPath, LogPath + ".old", null);
+                    File.AppendAllText(LogPath,
+                        DateTime.Now.ToString("MM-dd HH:mm:ss") + " " + line + Environment.NewLine, new UTF8Encoding(false));
+                }
+            }
+            catch { }
+        }
+    }
+
+    // ============ 平台槽位（Trae / WorkBuddy / ZCode 各一份） ============
     internal class PlatformSlot
     {
         public string Platform;
@@ -420,6 +443,7 @@ namespace TraeSign
             if (r == null) { UpdateTray(); return; }
             string brand = r.Brand ?? requestedBrand;
             bool ok = r.Success || r.CheckedIn;
+            RuntimeLog.Write(slot.Platform + (queryOnly ? " query" : " run") + " code=" + r.Code + " ok=" + ok + (r.HasClaimable ? " claimable" : "") + " msg=" + (r.DisplayText ?? r.Message));
 
             string userName = r.Username;
             if (string.IsNullOrEmpty(userName))
@@ -1919,11 +1943,20 @@ namespace TraeSign
             psi.FileName = edge;
             psi.Arguments = "--remote-debugging-port=" + port + " --user-data-dir=\"" + Path.Combine(tmpDir, "profile") + "\" --no-first-run --no-default-browser-check --window-size=420,300 --app=" + fileUrl;
             psi.UseShellExecute = false;
+            RuntimeLog.Write("captcha: launching edge port=" + port);
             Process proc = Process.Start(psi);
             try
             {
                 string wsUrl = WaitForPageWs(port, 20000);
-                return EvalUntilParam(wsUrl, SolveTimeoutMs);
+                RuntimeLog.Write("captcha: cdp connected");
+                string param = EvalUntilParam(wsUrl, SolveTimeoutMs);
+                RuntimeLog.Write("captcha: solved len=" + (param ?? "").Length);
+                return param;
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Write("captcha: FAILED " + ex.Message);
+                throw;
             }
             finally
             {
@@ -2885,6 +2918,7 @@ namespace TraeSign
             bool isZc = (Platform == "ZCode");
             string todayWord = isZc ? "套餐" : "今日";
             string creditWord = isZc ? "最近领取" : "积分";
+            _todayStatusLabel.ForeColor = Color.FromArgb(30, 30, 30);
 
             if (acc == null)
             {
@@ -2956,6 +2990,13 @@ namespace TraeSign
                 else if (last != null && !string.IsNullOrEmpty(last.DisplayText) && !ok)
                 {
                     _todayStatusLabel.Text = todayWord + "：" + last.DisplayText;
+                    _creditsLabel.Text = creditWord + "：--";
+                    _occupiedLabel.Visible = false;
+                }
+                else if (last != null && !ok && !string.IsNullOrEmpty(last.Message))
+                {
+                    _todayStatusLabel.Text = todayWord + "：" + (isZc ? "检查失败：" : "签到失败：") + last.Message;
+                    _todayStatusLabel.ForeColor = Color.FromArgb(244, 67, 54);
                     _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }

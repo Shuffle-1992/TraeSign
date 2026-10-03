@@ -1873,6 +1873,7 @@ namespace TraeSign
     {
         private const int SolveTimeoutMs = 90000;
         private const int PollIntervalMs = 1000;
+        private const int EdgeReadyTimeoutMs = 35000;
 
         public static string FindEdgePath()
         {
@@ -1938,16 +1939,19 @@ namespace TraeSign
             File.WriteAllText(htmlPath, html, new UTF8Encoding(false));
             string fileUrl = "file:///" + htmlPath.Replace('\\', '/');
 
-            int port = GetFreePort();
+            // 端口传 0：Edge 自选可用端口并写入 DevToolsActivePort 文件，彻底避开
+            // "程序预选端口被 Edge 绑定失败"这类环境问题
             var psi = new ProcessStartInfo();
             psi.FileName = edge;
-            psi.Arguments = "--remote-debugging-port=" + port + " --user-data-dir=\"" + Path.Combine(tmpDir, "profile") + "\" --no-first-run --no-default-browser-check --window-size=420,300 --app=" + fileUrl;
+            psi.Arguments = "--remote-debugging-port=0 --user-data-dir=\"" + Path.Combine(tmpDir, "profile") + "\" --no-first-run --no-default-browser-check --window-size=420,300 --app=" + fileUrl;
             psi.UseShellExecute = false;
-            RuntimeLog.Write("captcha: launching edge port=" + port);
+            psi.RedirectStandardError = true;
+            RuntimeLog.Write("captcha: launching edge (port=0, devtools-file mode)");
             Process proc = Process.Start(psi);
+            try { proc.ErrorDataReceived += OnEdgeStderr; proc.BeginErrorReadLine(); } catch { }
             try
             {
-                string wsUrl = WaitForPageWs(port, 20000);
+                string wsUrl = WaitForCdpReady(Path.Combine(tmpDir, "profile"), proc, EdgeReadyTimeoutMs);
                 RuntimeLog.Write("captcha: cdp connected");
                 string param = EvalUntilParam(wsUrl, SolveTimeoutMs);
                 RuntimeLog.Write("captcha: solved len=" + (param ?? "").Length);
@@ -1963,6 +1967,74 @@ namespace TraeSign
                 try { if (proc != null && !proc.HasExited) Process.Start("taskkill", "/PID " + proc.Id + " /T /F"); } catch { }
                 try { Directory.Delete(tmpDir, true); } catch { }
             }
+        }
+
+        private static void OnEdgeStderr(object sender, DataReceivedEventArgs e)
+        {
+            if (!string.IsNullOrEmpty(e.Data)) RuntimeLog.Write("edge: " + e.Data);
+        }
+
+        // Chromium 就绪后会在 user-data-dir 写 DevToolsActivePort（首行=端口）。
+        // 等该文件出现 → 读端口 → HTTP 确认 → 返回 captcha 页的 ws 地址
+        private static string WaitForCdpReady(string profileDir, Process proc, int timeoutMs)
+        {
+            DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
+            string devFile = Path.Combine(profileDir, "DevToolsActivePort");
+            bool fileSeen = false;
+            int port = 0;
+            while (DateTime.Now < deadline)
+            {
+                Thread.Sleep(600);
+                if (!fileSeen && File.Exists(devFile))
+                {
+                    fileSeen = true;
+                    try
+                    {
+                        string[] lines = File.ReadAllLines(devFile);
+                        if (lines.Length > 0) int.TryParse(lines[0].Trim(), out port);
+                        RuntimeLog.Write("captcha: devtools-file seen port=" + port + " at " + (long)(DateTime.Now - deadline.AddMilliseconds(-timeoutMs)).TotalMilliseconds + "ms");
+                    }
+                    catch { }
+                }
+                if (!fileSeen)
+                {
+                    bool alive = false;
+                    try { alive = !proc.HasExited; } catch { alive = true; }
+                    if (!alive) throw new Exception("Edge 启动后立即退出（可能被安全软件拦截），exit=" + SafeExitCode(proc));
+                    continue;
+                }
+                if (port > 0)
+                {
+                    string wsUrl = FindPageWs(port);
+                    if (wsUrl != null) return wsUrl;
+                }
+            }
+            throw new Exception("Edge 调试端口未就绪（devFile=" + (fileSeen ? "已出现但页面未就绪" : "35 秒未出现") + "），请重试一次");
+        }
+
+        private static string SafeExitCode(Process proc)
+        {
+            try { return proc.ExitCode.ToString(); } catch { return "?"; }
+        }
+
+        private static string FindPageWs(int port)
+        {
+            ApiResp r = HttpGetLocal("http://127.0.0.1:" + port + "/json/list");
+            if (r.Status != 200 || string.IsNullOrEmpty(r.Body)) return null;
+            var s = new JavaScriptSerializer();
+            object arr = null;
+            try { arr = s.DeserializeObject(r.Body); } catch { }
+            var list = arr as System.Collections.ArrayList;
+            if (list == null) return null;
+            foreach (object item in list)
+            {
+                var d = item as Dictionary<string, object>;
+                if (d == null) continue;
+                object type, ws;
+                if (d.TryGetValue("type", out type) && (type as string) == "page" && d.TryGetValue("webSocketDebuggerUrl", out ws))
+                    return ws as string;
+            }
+            return null;
         }
 
         private static string BuildCaptchaHtml(string scene, string region, string prefix)
@@ -2030,31 +2102,6 @@ namespace TraeSign
                 return r;
             }
             catch { return new ApiResp(); }
-        }
-
-        private static string WaitForPageWs(int port, int timeoutMs)
-        {
-            DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
-            while (DateTime.Now < deadline)
-            {
-                Thread.Sleep(500);
-                ApiResp r = HttpGetLocal("http://127.0.0.1:" + port + "/json/list");
-                if (r.Status != 200 || string.IsNullOrEmpty(r.Body)) continue;
-                var s = new JavaScriptSerializer();
-                object arr = null;
-                try { arr = s.DeserializeObject(r.Body); } catch { }
-                var list = arr as System.Collections.ArrayList;
-                if (list == null) continue;
-                foreach (object item in list)
-                {
-                    var d = item as Dictionary<string, object>;
-                    if (d == null) continue;
-                    object type, ws;
-                    if (d.TryGetValue("type", out type) && (type as string) == "page" && d.TryGetValue("webSocketDebuggerUrl", out ws))
-                        return ws as string;
-                }
-            }
-            throw new Exception("Edge 调试端口未就绪");
         }
 
         // 连 CDP，轮询 window.__P/__E 直到出参/报错/超时

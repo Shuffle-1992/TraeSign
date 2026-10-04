@@ -160,6 +160,11 @@ namespace TraeSign
                 RunCheckinAsync(false, "ZCode", null);
             });
             menu.Items.Add("打开主窗口", null, delegate { ShowMainWindow(); });
+            menu.Items.Add("环境需求说明", null, delegate
+            {
+                var dlg = new EnvironmentDialog();
+                dlg.Show();
+            });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, delegate { ExitApp(); });
             _tray.ContextMenuStrip = menu;
@@ -1523,6 +1528,157 @@ namespace TraeSign
         private static bool IsAuthCode(int code)
         {
             return code == 401 || code == 40100 || code == 12153;
+        }
+    }
+
+    // ============ 运行环境检测（供环境需求说明弹窗与自测） ============
+    internal static class EnvCheck
+    {
+        // .NET Framework 4.8 = Release 528040（Win10 1903+ 自带）
+        public const int DotNet48Release = 528040;
+
+        public static int GetDotNetRelease()
+        {
+            try
+            {
+                using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"))
+                {
+                    if (k == null) return 0;
+                    object v = k.GetValue("Release");
+                    if (v is int) return (int)v;
+                    try { return Convert.ToInt32(v); } catch { return 0; }
+                }
+            }
+            catch { return 0; }
+        }
+
+        public static bool HasDotNet48() { return GetDotNetRelease() >= DotNet48Release; }
+
+        public static string GetOsVersion()
+        {
+            try { return Environment.OSVersion.Version.Major + "." + Environment.OSVersion.Version.Minor + "（build " + Environment.OSVersion.Version.Build + "）"; }
+            catch { return "未知"; }
+        }
+
+        public static bool HasEdge()
+        {
+            return !string.IsNullOrEmpty(ZcodeCaptcha.FindEdgePath());
+        }
+
+        // 一行就绪状态："本机环境已就绪" / "本机缺少：.NET 4.8 运行时、Microsoft Edge"
+        public static string GetLocalStatus()
+        {
+            var missing = new List<string>();
+            if (!HasDotNet48()) missing.Add(".NET Framework 4.8 运行时");
+            if (!HasEdge()) missing.Add("Microsoft Edge");
+            return missing.Count == 0 ? "本机环境已就绪" : "本机缺少：" + string.Join("、", missing.ToArray());
+        }
+
+        // 给其他 AI Agent 的安装指引（复制后发给本机上的任意编程助手）
+        public static string BuildAgentPrompt()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("请在这台 Windows 电脑上检查并补齐 TraeSign.exe（三平台自动签到托盘程序）的运行环境：");
+            sb.AppendLine("1. 检测 .NET Framework 4.8 运行时：读注册表 HKLM\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Full 的 Release 值，>= 528040 即满足。若不满足，安装 .NET Framework 4.8 运行时（引导用户到 https://dotnet.microsoft.com/download/dotnet-framework/net48 下载 Runtime 安装，装完重启一次）；");
+            sb.AppendLine("2. 检测 Microsoft Edge 浏览器：确认 C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe 或 C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe 存在。若缺失，用 winget install Microsoft.Edge 或引导用户到官网安装；");
+            sb.AppendLine("3. 检查杀毒软件误报：TraeSign.exe 为本机 csc 编译、无数字签名，可能被 Defender 或安全管家误报，请协助加入信任/白名单；");
+            sb.AppendLine("4. 无需安装 Node.js、Python 或其他任何运行时，也无任何配置文件依赖；");
+            sb.AppendLine("5. 完成后双击运行 TraeSign.exe 验证：应最小化到系统托盘（任务栏右下角），托盘图标显示状态，双击托盘图标可打开主窗口（Trae / WorkBuddy / ZCode 三个页签）。");
+            return sb.ToString();
+        }
+    }
+
+    // ============ 环境需求说明弹窗 ============
+    internal class EnvironmentDialog : Form
+    {
+        private Button _copyBtn;
+
+        public EnvironmentDialog()
+        {
+            Text = "环境需求说明";
+            Width = 560;
+            Height = 560;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            Font = new Font("Microsoft YaHei UI", 9f);
+
+            var info = new TextBox();
+            info.Multiline = true;
+            info.ReadOnly = true;
+            info.ScrollBars = ScrollBars.Vertical;
+            info.BackColor = Color.White;
+            info.Location = new Point(12, 12);
+            info.Size = new Size(520, 250);
+            info.Text =
+                "TraeSign.exe 是零依赖的单文件程序，运行只需以下环境：\r\n" +
+                "\r\n" +
+                "1. Windows 10 1903 及以上 / Windows 11\r\n" +
+                "   （系统自带 .NET Framework 4.8 运行时；更老的系统如 LTSC 2019 需先安装一次 .NET 4.8 Runtime）\r\n" +
+                "2. Microsoft Edge 浏览器\r\n" +
+                "   （Windows 10/11 预装；仅 ZCode 自动领取时的验证码环节使用）\r\n" +
+                "3. 各平台客户端登录（可选）\r\n" +
+                "   Trae：本机装有 Trae 客户端并登录，自动读取登录态\r\n" +
+                "   WorkBuddy：无需客户端，在 WorkBuddy 页签点一次“登录授权”即可\r\n" +
+                "   ZCode：本机装有 ZCode 客户端/CLI 并登录，自动读取登录态\r\n" +
+                "\r\n" +
+                "无需安装 Node.js、Python 或其他任何运行时；无配置文件依赖。\r\n" +
+                "缺少某平台客户端不影响其他平台正常签到。\r\n" +
+                "杀软提示风险属误报（本机 csc 编译、无数字签名），加入信任即可。";
+
+            var statusLabel = new Label();
+            statusLabel.Location = new Point(12, 270);
+            statusLabel.AutoSize = false;
+            statusLabel.Size = new Size(520, 22);
+            statusLabel.Font = new Font(this.Font, FontStyle.Bold);
+            statusLabel.ForeColor = EnvCheck.HasDotNet48() && EnvCheck.HasEdge()
+                ? Color.FromArgb(76, 175, 80)
+                : Color.FromArgb(244, 67, 54);
+            statusLabel.Text = EnvCheck.GetLocalStatus() + "（系统 " + EnvCheck.GetOsVersion() + "）";
+
+            var agentLabel = new Label();
+            agentLabel.Location = new Point(12, 298);
+            agentLabel.AutoSize = false;
+            agentLabel.Size = new Size(520, 20);
+            agentLabel.ForeColor = Color.FromArgb(90, 90, 90);
+            agentLabel.Text = "复制以下提示词发给本机的 AI 编程助手（如 Trae / CodeBuddy），可自动安装缺失环境：";
+
+            var promptBox = new TextBox();
+            promptBox.Multiline = true;
+            promptBox.ReadOnly = true;
+            promptBox.ScrollBars = ScrollBars.Vertical;
+            promptBox.WordWrap = false;
+            promptBox.Location = new Point(12, 320);
+            promptBox.Size = new Size(520, 150);
+            promptBox.Text = EnvCheck.BuildAgentPrompt();
+
+            _copyBtn = new Button();
+            _copyBtn.Text = "复制提示词给 Agent";
+            _copyBtn.Location = new Point(12, 478);
+            _copyBtn.Size = new Size(170, 30);
+            _copyBtn.Click += delegate
+            {
+                try
+                {
+                    Clipboard.SetText(EnvCheck.BuildAgentPrompt());
+                    _copyBtn.Text = "已复制，可直接粘贴";
+                }
+                catch { _copyBtn.Text = "复制失败，请手动选择"; }
+            };
+
+            var closeBtn = new Button();
+            closeBtn.Text = "关闭";
+            closeBtn.Location = new Point(452, 478);
+            closeBtn.Size = new Size(80, 30);
+            closeBtn.Click += delegate { Close(); };
+
+            Controls.Add(info);
+            Controls.Add(statusLabel);
+            Controls.Add(agentLabel);
+            Controls.Add(promptBox);
+            Controls.Add(_copyBtn);
+            Controls.Add(closeBtn);
         }
     }
 
@@ -3429,6 +3585,17 @@ namespace TraeSign
                 string pageJson = "[{\"type\":\"page\",\"title\":\"TraeSign\",\"url\":\"file:///c.html\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9/devtools/page/ABC\"},{\"type\":\"service_worker\"}]";
                 Check("ZC json/list 页面解析(ArrayList)", ZcodeCaptcha.ParseJsonListToPageWs(pageJson) == "ws://127.0.0.1:9/devtools/page/ABC");
                 Check("ZC json/list 空数组", ZcodeCaptcha.ParseJsonListToPageWs("[]") == null);
+                Check("环境检测:提示词含关键词", EnvCheck.BuildAgentPrompt().Contains(".NET Framework 4.8") && EnvCheck.BuildAgentPrompt().Contains("Microsoft.Edge"));
+                Check("环境检测:本机状态非空", !string.IsNullOrEmpty(EnvCheck.GetLocalStatus()));
+                var envDlg = new EnvironmentDialog();
+                bool dlgInfoOk = false, dlgBtnOk = false;
+                foreach (System.Windows.Forms.Control ctl in envDlg.Controls)
+                {
+                    if (ctl is TextBox && ((TextBox)ctl).Text.Contains("零依赖的单文件程序")) dlgInfoOk = true;
+                    if (ctl is Button && ((Button)ctl).Text == "复制提示词给 Agent") dlgBtnOk = true;
+                }
+                Check("环境弹窗:说明与复制按钮就位", dlgInfoOk && dlgBtnOk);
+                envDlg.Dispose();
                 Check("ZC 日历跨天判定", PlatformPanel.ShouldSnapMonth(new DateTime(2026, 9, 30), new DateTime(2026, 10, 1))
                     && !PlatformPanel.ShouldSnapMonth(new DateTime(2026, 10, 1), new DateTime(2026, 10, 1)));
 

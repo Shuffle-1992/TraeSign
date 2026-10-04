@@ -2017,14 +2017,14 @@ namespace TraeSign
             try { return proc.ExitCode.ToString(); } catch { return "?"; }
         }
 
-        private static string FindPageWs(int port)
+        // /json/list 解析（静态纯函数，供测试）：注意 DeserializeObject 的数组根是 object[]
+        // 而非 ArrayList（踩坑 #13 同源），必须用 Deserialize<ArrayList> 才能解析成功
+        public static string ParseJsonListToPageWs(string body)
         {
-            ApiResp r = HttpGetLocal("http://127.0.0.1:" + port + "/json/list");
-            if (r.Status != 200 || string.IsNullOrEmpty(r.Body)) return null;
+            if (string.IsNullOrEmpty(body)) return null;
             var s = new JavaScriptSerializer();
-            object arr = null;
-            try { arr = s.DeserializeObject(r.Body); } catch { }
-            var list = arr as System.Collections.ArrayList;
+            System.Collections.ArrayList list = null;
+            try { list = s.Deserialize<System.Collections.ArrayList>(body); } catch { }
             if (list == null) return null;
             foreach (object item in list)
             {
@@ -2035,6 +2035,13 @@ namespace TraeSign
                     return ws as string;
             }
             return null;
+        }
+
+        private static string FindPageWs(int port)
+        {
+            ApiResp r = HttpGetLocal("http://127.0.0.1:" + port + "/json/list");
+            if (r.Status != 200 || string.IsNullOrEmpty(r.Body)) return null;
+            return ParseJsonListToPageWs(r.Body);
         }
 
         private static string BuildCaptchaHtml(string scene, string region, string prefix)
@@ -3412,6 +3419,9 @@ namespace TraeSign
                 Check("ZC 空 plans 解析", ZcodeRunner.ParsePreviewPlans("{\"code\":0,\"data\":{\"plans\":[]}}").Count == 0);
                 Check("ZC 非0 code 解析", ZcodeRunner.ParsePreviewPlans("{\"code\":401,\"msg\":\"x\"}").Count == 0);
                 Check("ZC Edge 路径探测", !string.IsNullOrEmpty(ZcodeCaptcha.FindEdgePath()));
+                string pageJson = "[{\"type\":\"page\",\"title\":\"TraeSign\",\"url\":\"file:///c.html\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9/devtools/page/ABC\"},{\"type\":\"service_worker\"}]";
+                Check("ZC json/list 页面解析(ArrayList)", ZcodeCaptcha.ParseJsonListToPageWs(pageJson) == "ws://127.0.0.1:9/devtools/page/ABC");
+                Check("ZC json/list 空数组", ZcodeCaptcha.ParseJsonListToPageWs("[]") == null);
                 Check("ZC 日历跨天判定", PlatformPanel.ShouldSnapMonth(new DateTime(2026, 9, 30), new DateTime(2026, 10, 1))
                     && !PlatformPanel.ShouldSnapMonth(new DateTime(2026, 10, 1), new DateTime(2026, 10, 1)));
 

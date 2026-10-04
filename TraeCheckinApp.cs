@@ -1904,9 +1904,12 @@ namespace TraeSign
         }
 
         // sceneId/region/prefix 来自 client/configs（失败用社区实测默认值）
-        public static string Solve()
+        public static string Solve(string region)
         {
-            string scene = "11xygtvd", region = "sgp", prefix = "no8xfe";
+            // 实测坑：client/configs 的 region 可能为 "cn"，但后端校验仍走 "sgp"，
+            // 用错区签发的参数会被 3007 拒绝 → region 由调用方按尝试顺序决定（sgp 优先，cn 兜底），
+            // 这里只取 sceneId/prefix（sceneId 未变过，取不到用默认）
+            string scene = "11xygtvd", prefix = "no8xfe";
             try
             {
                 ApiResp r = HttpApi.GetWithStatus(ZcodeAuth.BaseUrl + "/client/configs?app_version=" + ZcodeAuth.AppVersion, null);
@@ -1916,10 +1919,8 @@ namespace TraeSign
                     if (cfg != null)
                     {
                         string s = JsonUtil.GetString(cfg, "sceneId");
-                        string rg = JsonUtil.GetString(cfg, "region");
                         string pf = JsonUtil.GetString(cfg, "prefix");
                         if (!string.IsNullOrEmpty(s)) scene = s;
-                        if (!string.IsNullOrEmpty(rg)) region = rg;
                         if (!string.IsNullOrEmpty(pf)) prefix = pf;
                     }
                 }
@@ -2290,21 +2291,26 @@ namespace TraeSign
 
         private static CheckinResult ClaimPlan(string deviceMid, string jwt, string userId, ZcodePlan plan)
         {
-            for (int attempt = 0; attempt < 2; attempt++)
+            // 尝试顺序：先 sgp（当前后端校验区），3007 再换 cn（配置下发区，防后端未来迁移）
+            string[] regions = { "sgp", "cn" };
+            for (int attempt = 0; attempt < regions.Length; attempt++)
             {
+                string region = regions[attempt];
                 string vp;
-                try { vp = ZcodeCaptcha.Solve(); }
+                try { vp = ZcodeCaptcha.Solve(region); }
                 catch (Exception ex)
                 {
-                    if (attempt == 1) return CheckinResult.Fail(-4, "验证码未通过：" + ex.Message, ZcodeAuth.Platform);
+                    if (attempt == regions.Length - 1) return CheckinResult.Fail(-4, "验证码未通过：" + ex.Message, ZcodeAuth.Platform);
                     continue;
                 }
 
                 var headers = BuildHeaders(deviceMid, jwt);
                 headers["X-Aliyun-Captcha-Verify-Param"] = vp;
+                headers["Verify-Region"] = region;   // 与签发区一致，后端据此选阿里云区校验
                 var body = new Dictionary<string, object>();
                 body["plan_id"] = plan.PlanId;
                 string bodyJson = new JavaScriptSerializer().Serialize(body);
+                RuntimeLog.Write("claim: attempt=" + attempt + " region=" + region + " paramLen=" + vp.Length);
                 ApiResp r = HttpApi.PostWithStatus(ZcodeAuth.BaseUrl + "/zcode-plan/billing/claim", headers, bodyJson);
                 if (r == null || r.Status == 0)
                     return CheckinResult.Fail(-3, "网络异常：领取请求不可达", ZcodeAuth.Platform);
@@ -2328,9 +2334,10 @@ namespace TraeSign
                 }
                 if (code == 3007)
                 {
-                    if (attempt == 1)
-                        return CheckinResult.Fail(3007, "验证码校验失败（已重试一次）", ZcodeAuth.Platform);
-                    continue;   // 换新验证码重试一次
+                    RuntimeLog.Write("claim: 3007 with region=" + region + ", next region=" + (attempt < regions.Length - 1 ? regions[attempt + 1] : "none"));
+                    if (attempt == regions.Length - 1)
+                        return CheckinResult.Fail(3007, "验证码校验失败（sgp/cn 两区均已重试）", ZcodeAuth.Platform);
+                    continue;   // 换区 + 换新验证码重试
                 }
                 if (code == 1003)
                 {

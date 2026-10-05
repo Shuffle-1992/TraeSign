@@ -2027,9 +2027,10 @@ namespace TraeSign
     // ============ ZCode 阿里云无痕验证码（真实 Edge + CDP，零外部依赖） ============
     internal static class ZcodeCaptcha
     {
-        private const int SolveTimeoutMs = 90000;
+        private const int SolveTimeoutMs = 180000;
         private const int PollIntervalMs = 1000;
         private const int EdgeReadyTimeoutMs = 35000;
+        private const int DragMaxTries = 3;
 
         public static string FindEdgePath()
         {
@@ -2090,9 +2091,11 @@ namespace TraeSign
             string edge = FindEdgePath();
             if (string.IsNullOrEmpty(edge)) throw new Exception("未找到 Edge 浏览器，无法完成验证码");
             string html = BuildCaptchaHtml(scene, region, prefix);
-            string tmpDir = Path.Combine(Path.GetTempPath(), "TraeSign_cdp_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            Directory.CreateDirectory(tmpDir);
-            string htmlPath = Path.Combine(tmpDir, "captcha.html");
+            // 复用持久化 profile：cookies/信任积累可显著降低风控升级为滑块的概率
+            // （每次全新临时目录 = 全新设备特征，容易被判机器人）
+            string profileDir = Path.Combine(HistoryStore.DataDir, "EdgeProfile");
+            if (!Directory.Exists(profileDir)) Directory.CreateDirectory(profileDir);
+            string htmlPath = Path.Combine(profileDir, "captcha.html");
             File.WriteAllText(htmlPath, html, new UTF8Encoding(false));
             string fileUrl = "file:///" + htmlPath.Replace('\\', '/');
 
@@ -2100,15 +2103,15 @@ namespace TraeSign
             // "程序预选端口被 Edge 绑定失败"这类环境问题
             var psi = new ProcessStartInfo();
             psi.FileName = edge;
-            psi.Arguments = "--remote-debugging-port=0 --user-data-dir=\"" + Path.Combine(tmpDir, "profile") + "\" --no-first-run --no-default-browser-check --window-size=420,300 --app=" + fileUrl;
+            psi.Arguments = "--remote-debugging-port=0 --user-data-dir=\"" + profileDir + "\" --no-first-run --no-default-browser-check --window-size=460,640 --app=" + fileUrl;
             psi.UseShellExecute = false;
             psi.RedirectStandardError = true;
-            RuntimeLog.Write("captcha: launching edge (port=0, devtools-file mode)");
+            RuntimeLog.Write("captcha: launching edge (port=0, persistent-profile, region=" + region + ")");
             Process proc = Process.Start(psi);
             try { proc.ErrorDataReceived += OnEdgeStderr; proc.BeginErrorReadLine(); } catch { }
             try
             {
-                string wsUrl = WaitForCdpReady(Path.Combine(tmpDir, "profile"), proc, EdgeReadyTimeoutMs);
+                string wsUrl = WaitForCdpReady(profileDir, proc, EdgeReadyTimeoutMs);
                 RuntimeLog.Write("captcha: cdp connected");
                 string param = EvalUntilParam(wsUrl, SolveTimeoutMs);
                 RuntimeLog.Write("captcha: solved len=" + (param ?? "").Length);
@@ -2122,7 +2125,6 @@ namespace TraeSign
             finally
             {
                 try { if (proc != null && !proc.HasExited) Process.Start("taskkill", "/PID " + proc.Id + " /T /F"); } catch { }
-                try { Directory.Delete(tmpDir, true); } catch { }
             }
         }
 
@@ -2209,6 +2211,8 @@ namespace TraeSign
             sb.Append("<script src=\"https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js\"></script><script>");
             sb.Append("window.__P=null;window.__E=null;");
             sb.Append("(function t(){if(typeof initAliyunCaptcha!==\"function\"){setTimeout(t,200);return}");
+            // 加载后随机延迟再发起验证，模拟人的打开-操作间隔（瞬时动作抬高风控分）
+            sb.Append("setTimeout(function(){");
             sb.Append("initAliyunCaptcha({SceneId:").Append(JsonQuote(scene));
             sb.Append(",mode:\"popup\",region:").Append(JsonQuote(region));
             sb.Append(",prefix:").Append(JsonQuote(prefix));
@@ -2217,7 +2221,7 @@ namespace TraeSign
             // 实测：无痕验证成功时 success 回调参数本身就是 verifyParam 字符串
             sb.Append(",success:function(r){window.__P=(typeof r===\"string\")?r:((r&&r.captchaVerifyParam)||JSON.stringify(r))}");
             sb.Append(",fail:function(e){window.__E=\"fail:\"+JSON.stringify(e)}");
-            sb.Append(",onError:function(e){window.__E=\"onError:\"+JSON.stringify(e)}});})();");
+            sb.Append(",onError:function(e){window.__E=\"onError:\"+JSON.stringify(e)}});},600+Math.floor(Math.random()*1400));})();");
             sb.Append("</script></body></html>");
             return sb.ToString();
         }
@@ -2276,11 +2280,16 @@ namespace TraeSign
                 ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None).Wait(10000);
                 if (ws.State != System.Net.WebSockets.WebSocketState.Open) throw new Exception("无法连接 Edge 调试通道");
                 DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
+                DateTime balloonAt = DateTime.Now.AddSeconds(45000);
+                bool ballooned = false;
+                int dragTries = 0;
+                DateTime? iframeSince = null;
                 int msgId = 0;
                 while (DateTime.Now < deadline)
                 {
                     Thread.Sleep(PollIntervalMs);
-                    string expr = "JSON.stringify({p:window.__P,e:window.__E})";
+                    // 页面状态：参数/错误 + 验证码 iframe 位置（滑块拖动用）
+                    string expr = "JSON.stringify((function(){var f=document.querySelector('iframe');if(!f)return{p:window.__P,e:window.__E,ifr:0};var r=f.getBoundingClientRect();return {p:window.__P,e:window.__E,ifr:1,rx:Math.round(r.x),ry:Math.round(r.y),rw:Math.round(r.width),rh:Math.round(r.height)};})())";
                     msgId++;
                     string req = "{\"id\":" + msgId + ",\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":" + JsonQuote(expr) + ",\"returnByValue\":true}}";
                     string resp = WsRoundTrip(ws, req, msgId);
@@ -2293,11 +2302,99 @@ namespace TraeSign
                     var state = JsonUtil.ParseJson(value);
                     string p = JsonUtil.GetString(state, "p");
                     string e = JsonUtil.GetString(state, "e");
+                    int ifr = JsonUtil.GetInt(state, "ifr");
                     if (!string.IsNullOrEmpty(p)) return p;
-                    if (!string.IsNullOrEmpty(e)) throw new Exception("验证码失败：" + e);
+                    // F001 = 无痕验证被风控拒绝并升级为滑块：不放弃，页面会滑出滑块，
+                    // 成功回调仍会写 __P；其余错误才终止
+                    if (!string.IsNullOrEmpty(e) && e.IndexOf("F001", StringComparison.OrdinalIgnoreCase) < 0)
+                        throw new Exception("验证码失败：" + e);
+
+                    if (ifr == 1)
+                    {
+                        if (iframeSince == null)
+                        {
+                            iframeSince = DateTime.Now;
+                            RuntimeLog.Write("captcha: 检测到验证码 iframe（可能为滑块）");
+                        }
+                        int rx = JsonUtil.GetInt(state, "rx"), ry = JsonUtil.GetInt(state, "ry");
+                        int rw = JsonUtil.GetInt(state, "rw"), rh = JsonUtil.GetInt(state, "rh");
+                        // 等 2.8s 给无痕验证机会，仍未出参则模拟人手拖动
+                        if (iframeSince != null && (DateTime.Now - iframeSince.Value).TotalMilliseconds > 2800
+                            && dragTries < DragMaxTries && rw > 120 && rh > 60)
+                        {
+                            dragTries++;
+                            RuntimeLog.Write("captcha: 模拟拖动滑块 第" + dragTries + "次 rect=" + rx + "," + ry + " " + rw + "x" + rh);
+                            try { DragSlider(ws, rx, ry, rw, rh); }
+                            catch (Exception ex) { RuntimeLog.Write("captcha: 拖动异常 " + ex.Message); }
+                            iframeSince = DateTime.Now;   // 重新给一段观察期
+                        }
+                    }
+                    else
+                    {
+                        iframeSince = null;
+                    }
+
+                    // 人工兜底：自动拖动未通过时，请用户在可见窗口里手动拖
+                    if (!ballooned && dragTries > 0 && DateTime.Now > balloonAt)
+                    {
+                        ballooned = true;
+                        try
+                        {
+                            var inst = TrayApp.Instance;
+                            if (inst != null && inst.Tray != null)
+                                inst.Tray.ShowBalloonTip(8000, "TraeSign",
+                                    "ZCode 验证码已升级为滑块拼图，请在弹出的小窗口中手动拖动滑块完成（3 分钟内有效）",
+                                    ToolTipIcon.Info);
+                        }
+                        catch { }
+                    }
                 }
-                throw new Exception("验证码超时（可能触发了人工滑动验证），请稍后重试或在 ZCode 客户端手动领取");
+                throw new Exception("验证码超时：风控升级为滑块拼图且自动拖动未通过，请下次重试或在 ZCode 客户端手动领取");
             }
+        }
+
+        private static int _cdpSeq = 9000;
+
+        // 发 CDP 命令（不等响应；响应由 WsRoundTrip 的 id 过滤丢弃）
+        private static void SendCdp(System.Net.WebSockets.ClientWebSocket ws, string method, string paramsJson)
+        {
+            try
+            {
+                int id = Interlocked.Increment(ref _cdpSeq);
+                string req = "{\"id\":" + id + ",\"method\":\"" + method + "\",\"params\":" + paramsJson + "}";
+                byte[] payload = Encoding.UTF8.GetBytes(req);
+                ws.SendAsync(new ArraySegment<byte>(payload), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None).Wait(5000);
+            }
+            catch { }
+        }
+
+        // 模拟人手拖动滑块：按下 → 缓入缓出轨迹（带轻微抖动）→ 松开
+        private static void DragSlider(System.Net.WebSockets.ClientWebSocket ws, int rx, int ry, int rw, int rh)
+        {
+            int x0 = rx + 22, y0 = ry + rh - 30;
+            int x1 = rx + rw - 24;
+            if (x1 - x0 < 150) x1 = x0 + 150;
+            var rng = new Random(unchecked((int)DateTime.Now.Ticks));
+            SendCdp(ws, "Input.dispatchMouseEvent",
+                "{\"type\":\"mousePressed\",\"x\":" + x0 + ",\"y\":" + y0 + ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1}");
+            Thread.Sleep(rng.Next(120, 260));
+            int steps = 26;
+            double dist = x1 - x0;
+            for (int i = 1; i <= steps; i++)
+            {
+                double t = i / (double)steps;
+                double eased = t < 0.5 ? 2 * t * t : 1 - Math.Pow(-2 * t + 2, 2) / 2;   // easeInOutQuad
+                int x = x0 + (int)Math.Round(dist * eased);
+                int y = y0 + (int)Math.Round(Math.Sin(i * 1.3) * 1.6 + (rng.NextDouble() * 2 - 1));
+                SendCdp(ws, "Input.dispatchMouseEvent",
+                    "{\"type\":\"mouseMoved\",\"x\":" + x + ",\"y\":" + y + ",\"buttons\":1}");
+                Thread.Sleep(rng.Next(12, 34));
+            }
+            SendCdp(ws, "Input.dispatchMouseEvent",
+                "{\"type\":\"mouseMoved\",\"x\":" + x1 + ",\"y\":" + y0 + ",\"buttons\":1}");
+            Thread.Sleep(rng.Next(90, 180));
+            SendCdp(ws, "Input.dispatchMouseEvent",
+                "{\"type\":\"mouseReleased\",\"x\":" + x1 + ",\"y\":" + y0 + ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1}");
         }
 
         private static string WsRoundTrip(System.Net.WebSockets.ClientWebSocket ws, string req, int msgId)

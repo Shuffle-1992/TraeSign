@@ -2111,7 +2111,29 @@ namespace TraeSign
             try { proc.ErrorDataReceived += OnEdgeStderr; proc.BeginErrorReadLine(); } catch { }
             try
             {
-                string wsUrl = WaitForCdpReady(profileDir, proc, EdgeReadyTimeoutMs);
+                string wsUrl = null;
+                // 启动瞬时失败（如强杀残留的单例句柄导致 exit=0）与区域切换解耦：原地重试一次启动
+                for (int launchTry = 0; launchTry < 2; launchTry++)
+                {
+                    try
+                    {
+                        wsUrl = WaitForCdpReady(profileDir, proc, EdgeReadyTimeoutMs);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        RuntimeLog.Write("captcha: launch try" + (launchTry + 1) + " failed: " + ex.Message);
+                        try { if (!proc.HasExited) Process.Start("taskkill", "/PID " + proc.Id + " /T /F"); } catch { }
+                        if (launchTry == 0)
+                        {
+                            RuntimeLog.Write("captcha: relaunching after 2s…");
+                            Thread.Sleep(2000);
+                            proc = Process.Start(psi);
+                            try { proc.ErrorDataReceived += OnEdgeStderr; proc.BeginErrorReadLine(); } catch { }
+                        }
+                        else throw;
+                    }
+                }
                 RuntimeLog.Write("captcha: cdp connected");
                 string param = EvalUntilParam(wsUrl, SolveTimeoutMs);
                 RuntimeLog.Write("captcha: solved len=" + (param ?? "").Length);

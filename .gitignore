@@ -6,3 +6,6 @@ pitfalls.md
 
 # ZCode 会话工作目录（本地）
 .zcode/
+
+# 派发台运行日志（本地）
+collab/

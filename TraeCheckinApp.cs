@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -125,6 +125,7 @@ namespace TraeSign
         private PlatformSlot _trae;
         private PlatformSlot _wb;
         private PlatformSlot _zc;
+        private PlatformSlot _qd;
 
         // ZCode 活动套餐轮询（区别于每日签到：套餐随机投放，周期检查、发现即领）
         private System.Windows.Forms.Timer _zcodeTimer;
@@ -142,9 +143,12 @@ namespace TraeSign
             _wb.Platform = "WorkBuddy";
             _zc = new PlatformSlot();
             _zc.Platform = "ZCode";   // 活动套餐模型，无每日调度器
+            _qd = new PlatformSlot();
+            _qd.Platform = "Qoder";   // 每日 10:00 发放的领取制活动
             _slots.Add(_trae);
             _slots.Add(_wb);
             _slots.Add(_zc);
+            _slots.Add(_qd);
 
             _tray = new NotifyIcon();
             _tray.Visible = true;
@@ -158,6 +162,7 @@ namespace TraeSign
                 RunCheckinAsync(false, "Trae", null);
                 RunCheckinAsync(false, "WorkBuddy", null);
                 RunCheckinAsync(false, "ZCode", null);
+                RunCheckinAsync(false, "Qoder", null);
             });
             menu.Items.Add("打开主窗口", null, delegate { ShowMainWindow(); });
             menu.Items.Add("环境需求说明", null, delegate
@@ -171,8 +176,10 @@ namespace TraeSign
 
             foreach (var s in _slots)
             {
-                if (s.Platform == "ZCode") continue;
-                s.Scheduler = new DailyScheduler(this, s.Platform);
+                if (s.Platform == "ZCode") continue;   // ZCode 走轮询器，无每日调度器
+                // Qoder 的每日活动 10:00（UTC+8）刷新，留 5 分钟余量；Trae/WorkBuddy 仍为 00:05
+                TimeSpan target = (s.Platform == "Qoder") ? new TimeSpan(10, 5, 0) : new TimeSpan(0, 5, 0);
+                s.Scheduler = new DailyScheduler(this, s.Platform, target);
                 s.Scheduler.Start();
             }
             StartZcodePoller();
@@ -248,33 +255,40 @@ namespace TraeSign
         public static readonly Color LightRed = Color.FromArgb(244, 67, 54);
         public static readonly Color LightGray = Color.FromArgb(158, 158, 158);
 
+        // 领取制平台（ZCode 活动套餐 / Qoder 每日积分）用「领取」措辞，其余用「签到」
+        internal static bool IsClaimStyle(string platform)
+        {
+            return platform == "ZCode" || platform == "Qoder";
+        }
+
         public static void GetSlotLight(PlatformSlot s, out Color color, out string state)
         {
             color = LightGray;
             state = "待查询";
             if (s == null) return;
+            bool claimStyle = IsClaimStyle(s.Platform);
             if (s.Accounts.Count == 0)
             {
                 color = LightRed;
-                state = s.Platform == "WorkBuddy" ? "待授权" : "未找到登录态";
+                state = s.Platform == "WorkBuddy" ? "待授权" : (s.Platform == "Qoder" ? "未登录 Qoder" : "未找到登录态");
                 return;
             }
             if (s.Busy)
             {
-                state = s.Platform == "ZCode" ? "检查中" : "签到中";
+                state = claimStyle ? "检查中" : "签到中";
                 return;
             }
             var r = s.LastResult;
             if (r != null && (r.Success || r.CheckedIn))
             {
                 color = LightGreen;
-                state = s.Platform == "ZCode" ? "已领取" : "已签到";
+                state = claimStyle ? "已领取" : "已签到";
                 return;
             }
             if (r != null && r.Already)
             {
                 color = LightGreen;
-                state = s.Platform == "ZCode" ? "无活动" : "已签到";
+                state = s.Platform == "ZCode" ? "无活动" : (claimStyle ? "已领取" : "已签到");
                 return;
             }
             if (r != null && r.HasClaimable)
@@ -288,10 +302,16 @@ namespace TraeSign
                 state = "待授权";
                 return;
             }
+            // Code=0 且未领取：活动尚未下发/待领取，属正常等待态，不该亮红灯
+            if (r != null && r.Code == 0 && !r.Success && !r.CheckedIn && !r.Already && claimStyle)
+            {
+                state = "待领取";
+                return;
+            }
             if (r != null)
             {
                 color = LightRed;
-                state = s.Platform == "ZCode" ? "检查异常" : "未签到";
+                state = claimStyle ? "检查异常" : "未签到";
             }
         }
 
@@ -337,7 +357,7 @@ namespace TraeSign
                     TwoLists both;
                     try { both = t.Result; }
                     catch { both = null; }
-                    if (both != null) OnAccountsLoaded(both.Trae, both.Wb, both.Zc);
+                    if (both != null) OnAccountsLoaded(both.Trae, both.Wb, both.Zc, both.Qd);
                 }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
@@ -347,6 +367,7 @@ namespace TraeSign
             r.Trae = CheckinRunner.ListAccounts();
             r.Wb = WorkbuddyAuth.ListAccounts();
             r.Zc = ZcodeAuth.ListAccounts();
+            r.Qd = QoderAuth.ListAccounts();
             return r;
         }
 
@@ -356,7 +377,7 @@ namespace TraeSign
             LoadAccountsAsync();
         }
 
-        private void OnAccountsLoaded(List<AccountInfo> trae, List<AccountInfo> wb, List<AccountInfo> zc)
+        private void OnAccountsLoaded(List<AccountInfo> trae, List<AccountInfo> wb, List<AccountInfo> zc, List<AccountInfo> qd)
         {
             _trae.Accounts = trae ?? new List<AccountInfo>();
             string saved = HistoryStore.GetActiveBrand();
@@ -374,6 +395,9 @@ namespace TraeSign
             _zc.Accounts = zc ?? new List<AccountInfo>();
             _zc.ActiveBrand = _zc.Accounts.Count > 0 ? ZcodeAuth.Platform : null;
 
+            _qd.Accounts = qd ?? new List<AccountInfo>();
+            _qd.ActiveBrand = _qd.Accounts.Count > 0 ? QoderAuth.Platform : null;
+
             if (_form != null && !_form.IsDisposed)
             {
                 _form.RefreshAccounts();
@@ -381,17 +405,18 @@ namespace TraeSign
                 _form.RefreshView();
             }
 
-            if (_trae.Accounts.Count == 0 && _wb.Accounts.Count == 0 && _zc.Accounts.Count == 0)
+            if (_trae.Accounts.Count == 0 && _wb.Accounts.Count == 0 && _zc.Accounts.Count == 0 && _qd.Accounts.Count == 0)
             {
                 UpdateTray();
                 return;
             }
             if (_trae.ActiveBrand != null) _trae.Scheduler.ResetForBrand(_trae.ActiveBrand);
             if (_wb.ActiveBrand != null) _wb.Scheduler.ResetForBrand(_wb.ActiveBrand);
-            // 三平台并行查询状态（只查询，不签到；ZCode 发现可领套餐会触发自动领取）
+            // 各平台并行查询状态（只查询，不签到；ZCode 发现可领套餐会触发自动领取）
             RunCheckinAsync(true, "Trae", null);
             RunCheckinAsync(true, "WorkBuddy", null);
             RunCheckinAsync(true, "ZCode", null);
+            RunCheckinAsync(true, "Qoder", null);
         }
 
         private static bool HasBrand(PlatformSlot slot, string brand)
@@ -438,6 +463,7 @@ namespace TraeSign
         {
             if (platform == WorkbuddyAuth.Platform) return WorkbuddyRunner.Run(queryOnly);
             if (platform == ZcodeAuth.Platform) return ZcodeRunner.Run(queryOnly);
+            if (platform == QoderAuth.Platform) return QoderRunner.Run(queryOnly);
             return CheckinRunner.Run(queryOnly, brand);
         }
 
@@ -487,13 +513,15 @@ namespace TraeSign
 
             // 查询模式只在"已签到"时落库；签到模式无论成败都落库（ZCode 无活动查询不落库）
             bool zcNoop = (slot.Platform == "ZCode" && r.Already);
-            if ((!queryOnly || ok) && !zcNoop)
+            // Qoder 的 Already 代表"今日积分已领取"（真实业务结果，非无活动），按成功态落库
+            bool qdAlready = (slot.Platform == "Qoder" && r.Already);
+            if ((!queryOnly || ok || qdAlready) && !zcNoop)
                 HistoryStore.Upsert(new HistoryEntry
                 {
                     brand = brand,
                     date = DateTime.Now.ToString("yyyy-MM-dd"),
-                    success = ok,
-                    checked_in = r.CheckedIn,
+                    success = (ok || qdAlready),
+                    checked_in = (r.CheckedIn || qdAlready),
                     occupied = (r.Code == 9095),
                     code = r.Code,
                     baseCredits = r.Base,
@@ -519,8 +547,7 @@ namespace TraeSign
                 {
                     tip = string.IsNullOrEmpty(r.DisplayText) ? "今天已签到，无需重复签到" : r.DisplayText;
                     ticon = ToolTipIcon.Info;
-                }
-                else if (ok)
+                }                else if (ok)
                 {
                     tip = "签到成功：" + statusText;
                     ticon = ToolTipIcon.Info;
@@ -583,6 +610,7 @@ namespace TraeSign
         public List<AccountInfo> Trae;
         public List<AccountInfo> Wb;
         public List<AccountInfo> Zc;
+        public List<AccountInfo> Qd;
     }
 
     // ============ 签到引擎（内置，无外部依赖） ============
@@ -672,13 +700,36 @@ namespace TraeSign
         public static List<AuthData> FindAllAuths()
         {
             var list = new List<AuthData>();
+            var seen = new List<string>();
             string root = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            // ① 已知品牌优先（顺序稳定，多账号下拉/日历不受扫描顺序影响）
             foreach (var b in Brands)
+                AddAuthIfAny(list, seen, b, Path.Combine(root, b, "User", "globalStorage", "storage.json"));
+            // ② 自动检索：APPDATA 下任意 <产品名>\User\globalStorage\storage.json
+            //    覆盖 Trae 产品改名 / 新增版本 / 非 CN 发行版；ReadAuth 按 iCube 密文键过滤，不会误收其它 Electron 应用
+            try
             {
-                var a = ReadAuth(b, Path.Combine(root, b, "User", "globalStorage", "storage.json"));
-                if (a != null) list.Add(a);
+                foreach (string dir in Directory.GetDirectories(root))
+                {
+                    string name = Path.GetFileName(dir);
+                    if (name == "TraeCheckin") continue;   // 本程序自己的数据目录
+                    foreach (var b in Brands)
+                        if (name == b) { name = null; break; }
+                    if (name == null) continue;            // 已由 ① 处理
+                    AddAuthIfAny(list, seen, name, Path.Combine(dir, "User", "globalStorage", "storage.json"));
+                }
             }
+            catch { }
             return list;
+        }
+
+        private static void AddAuthIfAny(List<AuthData> list, List<string> seen, string brand, string file)
+        {
+            foreach (string s in seen)
+                if (string.Equals(s, file, StringComparison.OrdinalIgnoreCase)) return;
+            seen.Add(file);
+            var a = ReadAuth(brand, file);
+            if (a != null) list.Add(a);
         }
 
         private static AuthData ReadAuth(string brand, string file)
@@ -1060,15 +1111,93 @@ namespace TraeSign
         public static string TokenStorePath { get { return Path.Combine(HistoryStore.DataDir, "workbuddy_token.json"); } }
 
         // ---------- 本机客户端登录态 ----------
+        // 自动检索：已知插件目录优先，再扫 LOCALAPPDATA 下任意 *CodeBuddy*/*WorkBuddy* 目录里的 auth\*.info
+        private static readonly string[] AuthRoots = { "CodeBuddyExtension", "CodeBuddy", "WorkBuddy", "CodeBuddyCN" };
+
+        // 自动检索：返回实际命中的凭证目录（无则 null）。供 ReadClientFile 与自测共用。
+        public static string FindClientAuthDir()
+        {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            // ① 已知布局（Data\Public\auth）
+            foreach (string rootName in AuthRoots)
+            {
+                string dir = Path.Combine(local, rootName, "Data", "Public", "auth");
+                if (HasAuthFile(dir)) return dir;
+            }
+            // ② 自动检索：LOCALAPPDATA 下名字匹配的产品目录，递归浅层找 auth 目录
+            try
+            {
+                foreach (string root in Directory.GetDirectories(local))
+                {
+                    string n = Path.GetFileName(root);
+                    bool match = false;
+                    foreach (string key in AuthRoots)
+                        if (n.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0) { match = true; break; }
+                    if (!match) continue;
+                    string authDir = FindAuthDirUnder(root, 0);
+                    if (authDir != null && HasAuthFile(authDir)) return authDir;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static bool HasAuthFile(string dir)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return false;
+                foreach (string name in AuthFiles)
+                    if (File.Exists(Path.Combine(dir, name))) return true;
+                return Directory.GetFiles(dir, "*.info").Length > 0;
+            }
+            catch { return false; }
+        }
+
         public static WbAuthData ReadClientFile()
         {
-            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "CodeBuddyExtension", "Data", "Public", "auth");
-            foreach (string name in AuthFiles)
+            string dir = FindClientAuthDir();
+            return dir == null ? null : ScanAuthDir(dir);
+        }
+
+        // 深度受限的目录搜索（避免全盘递归拖慢启动）
+        private static string FindAuthDirUnder(string dir, int depth)
+        {
+            if (depth > 4) return null;
+            try
             {
-                var a = ReadAuthFile(Path.Combine(dir, name));
-                if (a != null) return a;
+                foreach (string sub in Directory.GetDirectories(dir))
+                {
+                    string n = Path.GetFileName(sub);
+                    if (string.Equals(n, "auth", StringComparison.OrdinalIgnoreCase)) return sub;
+                    string found = FindAuthDirUnder(sub, depth + 1);
+                    if (found != null) return found;
+                }
             }
+            catch { }
+            return null;
+        }
+
+        private static WbAuthData ScanAuthDir(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return null;
+            try
+            {
+                if (!Directory.Exists(dir)) return null;
+                // ① 已知文件名
+                foreach (string name in AuthFiles)
+                {
+                    var a = ReadAuthFile(Path.Combine(dir, name));
+                    if (a != null) return a;
+                }
+                // ② 自动检索：该目录下任意 *.info（产品改名/新增变体）
+                foreach (string f in Directory.GetFiles(dir, "*.info"))
+                {
+                    var a = ReadAuthFile(f);
+                    if (a != null) return a;
+                }
+            }
+            catch { }
             return null;
         }
 
@@ -1831,9 +1960,50 @@ namespace TraeSign
         public const string AppVersion = "3.14.3";   // 与官方桌面端现行版一致；preview 按 app_version 过滤活动可见性
         public const string EncPrefix = "enc:v1:";
 
+        // 自动检索：标准布局 ~/.zcode/v2/credentials.json 优先，再兜底若干历史/变体布局
         public static string CredentialsPath
         {
-            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "v2", "credentials.json"); }
+            get
+            {
+                try
+                {
+                    string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    string[] candidates = new string[]
+                    {
+                        Path.Combine(home, ".zcode", "v2", "credentials.json"),   // 现行标准
+                        Path.Combine(home, ".zcode", "credentials.json"),
+                        Path.Combine(home, ".zcode", "v1", "credentials.json"),
+                        Path.Combine(home, ".z-ai", "credentials.json")
+                    };
+                    foreach (string p in candidates)
+                        if (File.Exists(p)) return p;
+                    // 自动检索：~ 下任意 .zcode* 目录里深度 ≤3 的 credentials.json
+                    foreach (string dir in Directory.GetDirectories(home, ".zcode*"))
+                    {
+                        string found = FindCredFile(dir, 0);
+                        if (found != null) return found;
+                    }
+                    return candidates[0];
+                }
+                catch { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "v2", "credentials.json"); }
+            }
+        }
+
+        private static string FindCredFile(string dir, int depth)
+        {
+            if (depth > 3) return null;
+            try
+            {
+                string direct = Path.Combine(dir, "credentials.json");
+                if (File.Exists(direct)) return direct;
+                foreach (string sub in Directory.GetDirectories(dir))
+                {
+                    string found = FindCredFile(sub, depth + 1);
+                    if (found != null) return found;
+                }
+            }
+            catch { }
+            return null;
         }
 
         // 与 zcode CLI 一致的密钥种子：优先环境变量，否则机器信息回退
@@ -2930,14 +3100,22 @@ namespace TraeSign
         private System.Windows.Forms.Timer _timer;
         private TrayApp _app;
         private readonly string _platform;
+        private readonly TimeSpan _target;
         private DateTime? _lastAttemptDate;
         private DateTime? _nextRetryAt;
         private int _retryCount;
 
         public DailyScheduler(TrayApp app, string platform)
+            : this(app, platform, Target)
+        {
+        }
+
+        // 各平台目标时刻可不同：Trae/WorkBuddy 00:05，Qoder 10:05（每日活动 10:00 刷新）
+        public DailyScheduler(TrayApp app, string platform, TimeSpan target)
         {
             _app = app;
             _platform = platform;
+            _target = target;
             _lastAttemptDate = null;
             _nextRetryAt = null;
             _retryCount = 0;
@@ -3010,7 +3188,7 @@ namespace TraeSign
         {
             var now = DateTime.Now;
             if (now.Hour >= 23) return;                     // 当天放弃
-            if (!ShouldCheckinNow(now, _lastAttemptDate, _nextRetryAt, Target)) return;
+            if (!ShouldCheckinNow(now, _lastAttemptDate, _nextRetryAt, _target)) return;
             _app.RunCheckinAsync(false, _platform, null);
         }
     }
@@ -3047,6 +3225,8 @@ namespace TraeSign
 
             bool isWb = (platform == "WorkBuddy");
             bool isZc = (platform == "ZCode");
+            bool isQd = (platform == "Qoder");
+            bool isClaim = isZc || isQd;    // 领取制平台（Qoder 每日积分 / ZCode 活动套餐）
 
             // ---- 账号区 ----
             var accGroup = new GroupBox();
@@ -3062,7 +3242,7 @@ namespace TraeSign
             _accountCombo.SelectedIndexChanged += delegate { OnAccountChanged(); };
 
             _refreshBtn = new Button();
-            _refreshBtn.Text = isWb || isZc ? "刷新状态" : "刷新账号状态";
+            _refreshBtn.Text = isWb || isClaim ? "刷新状态" : "刷新账号状态";
             _refreshBtn.Location = new Point(330, 21);
             _refreshBtn.Size = new Size(84, 25);
             _refreshBtn.Click += delegate { _app.RefreshAccountsAndStatus(); };
@@ -3078,10 +3258,12 @@ namespace TraeSign
             _accountDetailLabel.Location = new Point(14, 52);
             _accountDetailLabel.AutoSize = false;
             _accountDetailLabel.Height = 40;
-            _accountDetailLabel.Width = (isWb || isZc) ? 310 : 400;
-            _accountDetailLabel.Text = isZc
-                ? "未找到 ZCode 登录态，请先登录 ZCode 客户端或 CLI"
-                : (isWb ? "未授权：点击“登录授权”完成一次浏览器登录" : "未找到登录态，请先运行 Trae 桌面端登录");
+            _accountDetailLabel.Width = (isWb || isClaim) ? 310 : 400;
+            _accountDetailLabel.Text = isQd
+                ? "未找到 Qoder 登录态，请先登录 Qoder CN 客户端"
+                : (isZc
+                    ? "未找到 ZCode 登录态，请先登录 ZCode 客户端或 CLI"
+                    : (isWb ? "未授权：点击“登录授权”完成一次浏览器登录" : "未找到登录态，请先运行 Trae 桌面端登录"));
 
             accGroup.Controls.Add(_accountCombo);
             accGroup.Controls.Add(_refreshBtn);
@@ -3092,7 +3274,7 @@ namespace TraeSign
             var todayGroup = new GroupBox();
             todayGroup.Dock = DockStyle.Top;
             todayGroup.Height = 88;
-            todayGroup.Text = isZc ? "套餐领取" : "今日签到";
+            todayGroup.Text = isQd ? "每日领取" : (isZc ? "套餐领取" : "今日签到");
             todayGroup.Padding = new Padding(10, 6, 10, 4);
 
             _todayStatusLabel = new Label();
@@ -3102,12 +3284,13 @@ namespace TraeSign
             _todayStatusLabel.Font = new Font(this.Font.FontFamily, 10f, FontStyle.Bold);
             _todayStatusLabel.Text = isZc ? "套餐：--" : "今日：--";
 
+
             _creditsLabel = new Label();
             _creditsLabel.Location = new Point(14, 50);
             _creditsLabel.AutoSize = false;
             _creditsLabel.Width = 400;
             _creditsLabel.ForeColor = Color.FromArgb(76, 175, 80);
-            _creditsLabel.Text = isZc ? "最近领取：--" : "积分：--";
+            _creditsLabel.Text = isClaim ? "最近领取：--" : "积分：--";
 
             _occupiedLabel = new Label();
             _occupiedLabel.Location = new Point(14, 64);
@@ -3125,7 +3308,7 @@ namespace TraeSign
             var autoGroup = new GroupBox();
             autoGroup.Dock = DockStyle.Top;
             autoGroup.Height = 100;
-            autoGroup.Text = isZc ? "自动领取" : "自动签到";
+            autoGroup.Text = isClaim ? "自动领取" : "自动签到";
             autoGroup.Padding = new Padding(10, 6, 10, 6);
 
             _autoNoteLabel = new Label();
@@ -3133,9 +3316,11 @@ namespace TraeSign
             _autoNoteLabel.AutoSize = false;
             _autoNoteLabel.Height = 20;
             _autoNoteLabel.Width = 400;
-            _autoNoteLabel.Text = isZc
-                ? "每 10 分钟自动检查新活动套餐，发现即自动领取"
-                : "每日 00:05 自动签到（" + platform + "）";
+            _autoNoteLabel.Text = isQd
+                ? "每日 10:05 自动领取 100 Credits（活动 10:00 UTC+8 刷新）"
+                : (isZc
+                    ? "每 10 分钟自动检查新活动套餐，发现即自动领取"
+                    : "每日 00:05 自动签到（" + platform + "）");
 
             _retryLabel = new Label();
             _retryLabel.Location = new Point(14, 52);
@@ -3146,7 +3331,7 @@ namespace TraeSign
             _retryLabel.Text = "";
 
             _checkinBtn = new Button();
-            _checkinBtn.Text = isZc ? "检查并领取" : "立即签到（手动）";
+            _checkinBtn.Text = isClaim ? "检查并领取" : "立即签到（手动）";
             _checkinBtn.Location = new Point(282, 48);
             _checkinBtn.Size = new Size(140, 32);
             _checkinBtn.Click += delegate { _app.RunCheckinAsync(false, Platform, null); };
@@ -3235,11 +3420,12 @@ namespace TraeSign
             var slot = _app.Slot(Platform);
             if (slot == null) return;
             // 自愈兜底：列表为空但本机凭证实际存在（装载竞态残留）→ 实时重读并回填
-            if (slot.Accounts.Count == 0 && (Platform == "ZCode" || Platform == "Trae"))
+            if (slot.Accounts.Count == 0 && (Platform == "ZCode" || Platform == "Trae" || Platform == "Qoder"))
             {
                 try
                 {
-                    List<AccountInfo> live = Platform == "ZCode" ? ZcodeAuth.ListAccounts() : CheckinRunner.ListAccounts();
+                    List<AccountInfo> live = Platform == "ZCode" ? ZcodeAuth.ListAccounts()
+                        : (Platform == "Qoder" ? QoderAuth.ListAccounts() : CheckinRunner.ListAccounts());
                     if (live.Count > 0)
                     {
                         slot.Accounts = live;
@@ -3252,21 +3438,25 @@ namespace TraeSign
             string active = slot.ActiveBrand;
             AccountInfo acc = slot.ActiveAccount();
             bool isZc = (Platform == "ZCode");
+            bool isQd = (Platform == "Qoder");
+            bool isClaim = isZc || isQd;
             string todayWord = isZc ? "套餐" : "今日";
-            string creditWord = isZc ? "最近领取" : "积分";
+            string creditWord = isClaim ? "最近领取" : "积分";
             _todayStatusLabel.ForeColor = Color.FromArgb(30, 30, 30);
 
             if (acc == null)
             {
-                _accountDetailLabel.Text = isZc
-                    ? "未找到 ZCode 登录态；请确认已登录 ZCode 客户端/CLI，或点“刷新状态”重试"
-                    : (Platform == "WorkBuddy"
-                        ? "未找到 WorkBuddy 客户端登录态；可点击“登录授权”直接授权本程序"
-                        : "未找到登录态，请先运行 Trae 桌面端登录");
+                _accountDetailLabel.Text = isQd
+                    ? "未找到 Qoder 登录态；请确认已登录 Qoder CN 客户端，或点“刷新状态”重试"
+                    : (isZc
+                        ? "未找到 ZCode 登录态；请确认已登录 ZCode 客户端/CLI，或点“刷新状态”重试"
+                        : (Platform == "WorkBuddy"
+                            ? "未找到 WorkBuddy 客户端登录态；可点击“登录授权”直接授权本程序"
+                            : "未找到登录态，请先运行 Trae 桌面端登录"));
                 _todayStatusLabel.Text = todayWord + "：--";
                 _creditsLabel.Text = creditWord + "：--";
                 _occupiedLabel.Visible = false;
-                _calendarGroup.Text = "签到日历";
+                _calendarGroup.Text = isClaim ? "领取日历" : "签到日历";
                 _calendar.SetData(new Dictionary<string, bool>());
                 return;
             }
@@ -3290,9 +3480,9 @@ namespace TraeSign
                 var last = slot.LastResult;
                 if (ok)
                 {
-                    _todayStatusLabel.Text = todayWord + "：" + (isZc ? "已领取" : "已签到");
-                    if (isZc)
-                        _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.HasValue ? entry.baseCredits.GetValueOrDefault(0).ToString("N0") : "--") + " token";
+                    _todayStatusLabel.Text = todayWord + "：" + (isClaim ? "已领取" : "已签到");
+                    if (isClaim)
+                        _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.HasValue ? entry.baseCredits.GetValueOrDefault(0).ToString("N0") : "--") + (isQd ? " Credits" : " token");
                     else if (entry.baseCredits.HasValue || entry.extra.HasValue)
                         _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.GetValueOrDefault(0) + entry.extra.GetValueOrDefault(0)) + "（基础" + entry.baseCredits + " 额外" + entry.extra + "）";
                     else
@@ -3311,6 +3501,12 @@ namespace TraeSign
                     _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }
+                else if (last != null && last.Already && isQd)
+                {
+                    _todayStatusLabel.Text = todayWord + "：" + (string.IsNullOrEmpty(last.DisplayText) ? "已领取" : last.DisplayText);
+                    _creditsLabel.Text = creditWord + "：" + (last.Base.HasValue ? "+" + last.Base.GetValueOrDefault(0).ToString("N0") + " Credits" : "--");
+                    _occupiedLabel.Visible = false;
+                }
                 else if (entry != null && entry.occupied)
                 {
                     _todayStatusLabel.Text = "今日：未签到（本机已被另一账号签到）";
@@ -3319,7 +3515,7 @@ namespace TraeSign
                 }
                 else if (entry != null && entry.code == -6)
                 {
-                    _todayStatusLabel.Text = "今日：" + (isZc ? "登录已失效，请重新登录 ZCode" : (Platform == "WorkBuddy" ? "登录已失效，请重新授权" : "账号状态异常（token 可能已过期）"));
+                    _todayStatusLabel.Text = "今日：" + (isQd ? "登录已失效，请重新登录 Qoder" : (isZc ? "登录已失效，请重新登录 ZCode" : (Platform == "WorkBuddy" ? "登录已失效，请重新授权" : "账号状态异常（token 可能已过期）")));
                     _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }
@@ -3331,30 +3527,34 @@ namespace TraeSign
                 }
                 else if (last != null && !ok && !string.IsNullOrEmpty(last.Message))
                 {
-                    _todayStatusLabel.Text = todayWord + "：" + (isZc ? "检查失败：" : "签到失败：") + last.Message;
+                    _todayStatusLabel.Text = todayWord + "：" + (isClaim ? "检查失败：" : "签到失败：") + last.Message;
                     _todayStatusLabel.ForeColor = Color.FromArgb(244, 67, 54);
                     _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }
                 else
                 {
-                    _todayStatusLabel.Text = todayWord + "：" + (isZc ? "待检查" : "未签到");
+                    _todayStatusLabel.Text = todayWord + "：" + (isClaim ? "待检查" : "未签到");
                     _creditsLabel.Text = creditWord + "：--";
                     _occupiedLabel.Visible = false;
                 }
             }
 
-            _autoNoteLabel.Text = isZc
-                ? "每 10 分钟自动检查新活动套餐（登录名：" + (string.IsNullOrEmpty(acc.Username) ? "--" : acc.Username) + "）"
-                : "每日 00:05 自动签到（" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
+            _autoNoteLabel.Text = isQd
+                ? "每日 10:05 自动领取（登录名：" + (string.IsNullOrEmpty(acc.Username) ? "--" : acc.Username) + "）"
+                : (isZc
+                    ? "每 10 分钟自动检查新活动套餐（登录名：" + (string.IsNullOrEmpty(acc.Username) ? "--" : acc.Username) + "）"
+                    : "每日 00:05 自动签到（" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）");
             var retry = slot.Scheduler != null ? slot.Scheduler.NextRetryAt : null;
-            _retryLabel.Text = isZc
-                ? "发现新套餐会自动领取并气泡通知"
-                : (retry.HasValue
-                    ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm")
-                    : "自动签到已开启，失败后自动重试");
+            _retryLabel.Text = isQd
+                ? (retry.HasValue ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm") : "每天 10:00 后自动领取 100 Credits")
+                : (isZc
+                    ? "发现新套餐会自动领取并气泡通知"
+                    : (retry.HasValue
+                        ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm")
+                        : "自动签到已开启，失败后自动重试"));
 
-            _calendarGroup.Text = isZc
+            _calendarGroup.Text = isClaim
                 ? "领取日历（登录名：" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）"
                 : "签到日历（账号：" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）";
             RefreshCalendar();
@@ -3402,12 +3602,13 @@ namespace TraeSign
         private PlatformPanel _traePanel;
         private PlatformPanel _wbPanel;
         private PlatformPanel _zcPanel;
+        private PlatformPanel _qdPanel;
 
         public MainForm(TrayApp app)
         {
             _app = app;
             Text = "TraeSign - 每日签到";
-            Width = 460;
+            Width = 500;
             Height = 726;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -3455,13 +3656,18 @@ namespace TraeSign
             _zcPanel = new PlatformPanel(app, "ZCode");
             tpZc.Controls.Add(_zcPanel);
 
+            var tpQd = new TabPage("Qoder");
+            _qdPanel = new PlatformPanel(app, "Qoder");
+            tpQd.Controls.Add(_qdPanel);
+
             _tabs.TabPages.Add(tpTrae);
             _tabs.TabPages.Add(tpWb);
             _tabs.TabPages.Add(tpZc);
+            _tabs.TabPages.Add(tpQd);
 
             // OwnerDrawFixed 的页签尺寸须在页签加入后设置才生效
             _tabs.SizeMode = TabSizeMode.Fixed;
-            _tabs.ItemSize = new Size(118, 30);
+            _tabs.ItemSize = new Size(115, 30);
 
             Controls.Add(_tabs);
             Controls.Add(titlePanel);
@@ -3503,6 +3709,7 @@ namespace TraeSign
             _traePanel.RefreshAccounts();
             _wbPanel.RefreshAccounts();
             _zcPanel.RefreshAccounts();
+            _qdPanel.RefreshAccounts();
         }
 
         public void RefreshView()
@@ -3528,6 +3735,7 @@ namespace TraeSign
             _traePanel.RefreshView();
             _wbPanel.RefreshView();
             _zcPanel.RefreshView();
+            _qdPanel.RefreshView();
             _tabs.Invalidate();   // 状态灯重绘
         }
 
@@ -3728,6 +3936,71 @@ namespace TraeSign
                 {
                     sb.AppendLine("[SKIP] ZC 真实查询（无 ZCode 登录态，跳过）");
                 }
+
+                // 12. Qoder：safeStorage 解密 / 活动解析 / UMID / 真实只读查询
+                var qdCreds = QoderAuth.Load();
+                if (qdCreds != null)
+                {
+                    Check("QD 凭证解密(token 前缀 dt-)", !string.IsNullOrEmpty(qdCreds.Token) && qdCreds.Token.StartsWith("dt-"));
+                    Check("QD 凭证含 refreshToken(drt-)", !string.IsNullOrEmpty(qdCreds.RefreshToken) && qdCreds.RefreshToken.StartsWith("drt-"));
+                    Check("QD 凭证含 uid", !string.IsNullOrEmpty(qdCreds.Uid));
+                    var qdAccounts = QoderAuth.ListAccounts();
+                    Check("QD 账号列表=1(实际=" + qdAccounts.Count + ")", qdAccounts.Count == 1 && qdAccounts[0].Brand == QoderAuth.Platform);
+                    // 凭证目录必须是"自动检索"出来的真实目录（含 auth.v1.dat），而非写死路径
+                    string qdDir = QoderAuth.DataDir();
+                    Check("QD 凭证目录自动检索(auth.v1.dat 存在)", File.Exists(Path.Combine(qdDir, "auth.v1.dat")));
+                    // 安装目录自动检索：跨盘/注册表卸载项都要能命中（未装客户端则跳过）
+                    string qdInstall = QoderAuth.FindInstallDir();
+                    if (!string.IsNullOrEmpty(qdInstall))
+                        Check("QD 安装目录自动检索(" + Path.GetFileName(qdInstall) + ")", Directory.Exists(qdInstall));
+                    else
+                        sb.AppendLine("[SKIP] QD 安装目录检索（未装 Qoder CN 客户端）");
+                }
+                else
+                {
+                    sb.AppendLine("[SKIP] QD 凭证解密（未登录 Qoder CN 客户端）");
+                }
+                // 真实响应向量（2026-10-20 实测，今日已领）→ 解析必须得到 CLAIM_BENEFIT/CLAIMED
+                string qdJson = "{\"uid\":\"u1\",\"claimable\":false,\"campaigns\":["
+                    + "{\"campaignId\":\"c1\",\"campaignKey\":\"act-1\",\"actionType\":\"CLAIM_BENEFIT\",\"claimStatus\":\"CLAIMED\","
+                    + "\"benefit\":{\"kind\":\"CREDITS\",\"amount\":100,\"validity\":{\"mode\":\"RELATIVE_DAYS\",\"days\":30}}},"
+                    + "{\"campaignId\":\"c2\",\"actionType\":\"VIEW_DETAILS\",\"claimStatus\":\"CLAIMED\"}]}";
+                var qc = QoderRunner.ParseCampaigns(qdJson);
+                Check("QD 活动解析(2 条)", qc.Count == 2);
+                bool foundClaim = false;
+                foreach (var qcamp in qc)
+                    if (qcamp.ActionType == "CLAIM_BENEFIT" && qcamp.ClaimStatus == "CLAIMED" && qcamp.CampaignId == "c1" && qcamp.Amount == 100 && qcamp.Days == 30) foundClaim = true;
+                Check("QD CLAIM_BENEFIT/金额/有效期解析", foundClaim);
+                Check("QD 空 campaigns 解析", QoderRunner.ParseCampaigns("{\"campaigns\":[]}").Count == 0);
+                Check("QD data.campaigns 兼容", QoderRunner.ParseCampaigns("{\"data\":{\"campaigns\":[{\"campaignId\":\"c9\",\"actionType\":\"CLAIM_BENEFIT\",\"claimStatus\":\"CLAIMABLE\"}]}}").Count == 1);
+                Check("QD 非法 JSON 不抛异常", QoderRunner.ParseCampaigns("not-json").Count == 0);
+                Check("QD 领取制平台判定", TrayApp.IsClaimStyle("Qoder") && TrayApp.IsClaimStyle("ZCode") && !TrayApp.IsClaimStyle("Trae"));
+                // UMID 风控三件套（组件缺失则跳过，不算失败）
+                var qdUmid = QoderUmid.Get(qdCreds == null ? null : qdCreds.Uid);
+                if (qdUmid != null)
+                    Check("QD UMID 三件套齐全", qdUmid.ContainsKey("machineToken") && qdUmid.ContainsKey("machineCode") && qdUmid.ContainsKey("machineType"));
+                else
+                    sb.AppendLine("[SKIP] QD UMID 组件（本机未找到 runtime-info.exe，将跳过 Cosy-Machine* 头）");
+                // 真实只读查询（不 claim）
+                if (qdCreds != null)
+                {
+                    var qq = QoderRunner.Run(true);
+                    Check("QD 真实查询(code=" + qq.Code + ")", qq.Code == 0 || qq.Code == -6 || qq.Code == -3);
+                }
+                else
+                {
+                    sb.AppendLine("[SKIP] QD 真实查询（无 Qoder 登录态，跳过）");
+                }
+
+                // 13. 登录态路径「自动检索」断言（防止路径写死退化）
+                Check("ZC 凭证路径自动检索(文件存在)", File.Exists(ZcodeAuth.CredentialsPath));
+                var traeAuths = TraeAuth.FindAllAuths();
+                Check("Trae 账号检索覆盖品牌目录(实际=" + traeAuths.Count + ")", traeAuths.Count >= 1);
+                string wbDirProbe = WorkbuddyAuth.FindClientAuthDir();
+                if (!string.IsNullOrEmpty(wbDirProbe))
+                    Check("WB 凭证目录自动检索", Directory.Exists(wbDirProbe));
+                else
+                    sb.AppendLine("[SKIP] WB 凭证目录检索（未装 WorkBuddy 客户端）");
             }
             catch (Exception ex)
             {

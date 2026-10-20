@@ -1,5 +1,6 @@
 @echo off
-setlocal
+setlocal EnableExtensions
+rem TraeSign build script (Trae / WorkBuddy / ZCode / Qoder)
 set CSC=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 set LIBDIR=C:\Windows\Microsoft.NET\Framework64\v4.0.30319
 
@@ -14,7 +15,7 @@ taskkill /IM TraeSign.exe /F >nul 2>&1
   /reference:System.Security.dll ^
   /win32manifest:app.manifest ^
   /win32icon:app.ico ^
-  TraeCheckinApp.cs CalendarControl.cs
+  TraeCheckinApp.cs CalendarControl.cs QoderCheckin.cs
 
 if errorlevel 1 (
   echo COMPILE FAILED

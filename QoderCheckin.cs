@@ -703,6 +703,8 @@ namespace TraeSign
         public string ClaimStatus;
         public int Amount;
         public int Days;
+        public long StartAt;      // unix 秒；活动生效起点（Qoder 每日 10:00 UTC+8 下发）
+        public long EndAt;        // unix 秒；活动失效点（次日 09:59）
     }
 
     // ============ Qoder 每日 100 Credits 领取引擎 ============
@@ -738,6 +740,8 @@ namespace TraeSign
                     c.Amount = amount < 0 ? 0 : amount;
                     int days = JsonUtil.GetInt(JsonUtil.GetDict(benefit, "validity"), "days");
                     c.Days = days < 0 ? 0 : days;
+                    c.StartAt = JsonUtil.GetLong(d, "startAt");
+                    c.EndAt = JsonUtil.GetLong(d, "endAt");
                     if (!string.IsNullOrEmpty(c.CampaignId)) list.Add(c);
                 }
             }
@@ -781,9 +785,22 @@ namespace TraeSign
                 List<QoderCampaign> campaigns = ParseCampaigns(list.Body);
                 QoderCampaign target = null;
                 QoderCampaign claimed = null;
+                long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                DateTime today = DateTime.Now.Date;
                 foreach (QoderCampaign c in campaigns)
                 {
                     if (c.ActionType != "CLAIM_BENEFIT") continue;
+                    // 关键：只认「今天这一期」的活动。
+                    // Qoder 每日 10:00（UTC+8）下发一期，有效期到次日 09:59——所以每天 10:00 之前，
+                    // 服务端只有【昨天那期】且通常已是 CLAIMED。若不加期次过滤，凌晨/上午查询会把
+                    // 昨天已领误判成「今天已领取」→ 历史误写成功 → 调度器当天停摆 → 10:00 新一期不领。
+                    // 判据：期次归属日以 startAt 的本地日期为准（campaignKey 形如 act-20261020-894 同源）。
+                    if (c.StartAt > 0)
+                    {
+                        DateTime campDate = DateTimeOffset.FromUnixTimeSeconds(c.StartAt).LocalDateTime.Date;
+                        if (campDate < today) continue;      // 往期活动：不算今天已领，也不作为可领目标
+                    }
+                    if (c.EndAt > 0 && c.EndAt <= nowSec) continue;   // 已过期兜底
                     if (c.ClaimStatus == "CLAIMABLE")
                     {
                         if (target == null) target = c;

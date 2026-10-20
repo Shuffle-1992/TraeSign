@@ -513,9 +513,10 @@ namespace TraeSign
 
             // 查询模式只在"已签到"时落库；签到模式无论成败都落库（ZCode 无活动查询不落库）
             bool zcNoop = (slot.Platform == "ZCode" && r.Already);
-            // Qoder 的 Already 代表"今日积分已领取"（真实业务结果，非无活动），按成功态落库
-            bool qdAlready = (slot.Platform == "Qoder" && r.Already);
-            if ((!queryOnly || ok || qdAlready) && !zcNoop)
+            // Qoder：查询阶段发现的「今日已领取」不写库——否则凌晨查询会先把今天记成成功，
+            // 造成日历假绿，且 ResetForBrand 会据该记录跳过当天调度。
+            bool qdAlready = (slot.Platform == "Qoder" && r.Already && !queryOnly);
+            if ((!queryOnly || ok) && !zcNoop)
                 HistoryStore.Upsert(new HistoryEntry
                 {
                     brand = brand,
@@ -3955,6 +3956,26 @@ namespace TraeSign
                         Check("QD 安装目录自动检索(" + Path.GetFileName(qdInstall) + ")", Directory.Exists(qdInstall));
                     else
                         sb.AppendLine("[SKIP] QD 安装目录检索（未装 Qoder CN 客户端）");
+
+                    // 活动期次判据（防回归）：startAt/endAt 必须解析出来；
+                    // 昨天那期（归属日 < 今天）必须被排除，不能被当成"今天已领取"
+                    string qdPeriodJson = "{\"claimable\":false,\"campaigns\":[{\"campaignId\":\"c-old\",\"campaignKey\":\"act-old\",\"actionType\":\"CLAIM_BENEFIT\",\"startAt\":"
+                        + new DateTimeOffset(DateTime.Now.Date.AddDays(-1)).ToUnixTimeSeconds()
+                        + ",\"endAt\":" + new DateTimeOffset(DateTime.Now.Date.AddDays(1)).ToUnixTimeSeconds()
+                        + ",\"claimStatus\":\"CLAIMED\",\"benefit\":{\"amount\":100,\"validity\":{\"days\":30}}}]}";
+                    var qdPeriod = QoderRunner.ParseCampaigns(qdPeriodJson);
+                    Check("QD 活动期次解析(startAt/endAt)", qdPeriod.Count == 1 && qdPeriod[0].StartAt > 0 && qdPeriod[0].EndAt > 0);
+                    bool periodExcluded = qdPeriod.Count == 1
+                        && DateTimeOffset.FromUnixTimeSeconds(qdPeriod[0].StartAt).LocalDateTime.Date < DateTime.Now.Date;
+                    Check("QD 往期活动不计入今日(期次判据)", periodExcluded);
+                    // 今天的期次必须保留（不能被误排除）
+                    string qdTodayJson = "{\"campaigns\":[{\"campaignId\":\"c-today\",\"actionType\":\"CLAIM_BENEFIT\",\"startAt\":"
+                        + new DateTimeOffset(DateTime.Now.Date).ToUnixTimeSeconds()
+                        + ",\"endAt\":" + new DateTimeOffset(DateTime.Now.Date.AddDays(1)).ToUnixTimeSeconds()
+                        + ",\"claimStatus\":\"CLAIMED\",\"benefit\":{\"amount\":100}}]}";
+                    var qdToday = QoderRunner.ParseCampaigns(qdTodayJson);
+                    Check("QD 当日活动不被排除",
+                        qdToday.Count == 1 && DateTimeOffset.FromUnixTimeSeconds(qdToday[0].StartAt).LocalDateTime.Date == DateTime.Now.Date);
                 }
                 else
                 {

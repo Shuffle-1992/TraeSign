@@ -830,7 +830,7 @@ namespace TraeSign
                     {
                         Success = false, Code = 0, CheckedIn = false, Already = false,
                         Username = username,
-                        DisplayText = "今日暂无可领取活动（每日 10:00 刷新）",
+                        DisplayText = "今日暂无可领取活动（活动 10:00 刷新，程序 10:05 自动领取）",
                         Brand = QoderAuth.Platform
                     };
                 }
@@ -842,7 +842,7 @@ namespace TraeSign
                     {
                         Success = false, Code = 0, CheckedIn = false, Already = false,
                         Username = username,
-                        DisplayText = "今日活动 10:00（UTC+8）开启，稍后自动重试",
+                        DisplayText = "今日活动 10:00（UTC+8）开启，程序将于 10:05 自动重试",
                         Brand = QoderAuth.Platform
                     };
                 }

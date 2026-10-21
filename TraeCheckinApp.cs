@@ -177,8 +177,9 @@ namespace TraeSign
             foreach (var s in _slots)
             {
                 if (s.Platform == "ZCode") continue;   // ZCode 走轮询器，无每日调度器
-                // Qoder 的每日活动 10:00（UTC+8）刷新，留 5 分钟余量；Trae/WorkBuddy 仍为 00:05
-                TimeSpan target = (s.Platform == "Qoder") ? new TimeSpan(10, 5, 0) : new TimeSpan(0, 5, 0);
+                // 各平台签到时刻：Qoder 活动每天 10:00（UTC+8）刷新，程序固定 10:05 自动签到；
+                // Trae / WorkBuddy 保持 00:05 不变。
+                TimeSpan target = (s.Platform == "Qoder") ? DailyScheduler.QoderTarget : DailyScheduler.Target;
                 s.Scheduler = new DailyScheduler(this, s.Platform, target);
                 s.Scheduler.Start();
             }
@@ -3095,7 +3096,8 @@ namespace TraeSign
     // ============ 每日调度（每平台独立一份） ============
     internal class DailyScheduler
     {
-        private static readonly TimeSpan Target = new TimeSpan(0, 5, 0);
+        internal static readonly TimeSpan Target = new TimeSpan(0, 5, 0);        // Trae / WorkBuddy：每日 00:05
+        internal static readonly TimeSpan QoderTarget = new TimeSpan(10, 5, 0); // Qoder：每日 10:05（活动 10:00 刷新）
         private static readonly int[] BackoffMinutes = { 5, 15, 30, 60, 120 };
 
         private System.Windows.Forms.Timer _timer;
@@ -3145,18 +3147,40 @@ namespace TraeSign
             return r.Success || r.CheckedIn || r.Code == 9095;
         }
 
+        // 纯逻辑（供测试）：算出失败后的下次重试时刻与新的退避计数
+        // 规则：① 目标时刻之前失败 = "时间没到"，不消耗退避、回到等目标状态
+        //       ② 退避不得跨过「目标+宽限期」，否则会跨过当天关键时间点
+        public static void NextRetryAfterFailure(DateTime now, TimeSpan target, int retryCount,
+            out DateTime? nextRetryAt, out int newRetryCount)
+        {
+            if (now.TimeOfDay < target)
+            {
+                nextRetryAt = null;
+                newRetryCount = retryCount;
+                return;
+            }
+            int[] backoff = { 5, 15, 30, 60, 120 };
+            DateTime next = now.AddMinutes(backoff[Math.Min(retryCount, backoff.Length - 1)]);
+            DateTime deadline = now.Date.Add(target).AddHours(2);
+            bool clamped = (now < deadline && next > deadline);
+            if (clamped) next = deadline;
+            nextRetryAt = next;
+            newRetryCount = (!clamped && retryCount < backoff.Length - 1) ? retryCount + 1 : retryCount;
+        }
+
         // 签到尝试结果回填：成功/占用→当天停止；其他失败→退避重试
         public void NotifyResult(CheckinResult r)
         {
             if (ShouldStopToday(r))
             {
                 MarkManualDone();
+                return;
             }
-            else
-            {
-                _nextRetryAt = DateTime.Now.AddMinutes(BackoffMinutes[Math.Min(_retryCount, BackoffMinutes.Length - 1)]);
-                if (_retryCount < BackoffMinutes.Length - 1) _retryCount++;
-            }
+            DateTime? next;
+            int newCount;
+            NextRetryAfterFailure(DateTime.Now, _target, _retryCount, out next, out newCount);
+            _nextRetryAt = next;
+            _retryCount = newCount;
         }
 
         // 切换账号时重置：新账号今日未尝试→立即补签；已尝试→按记录跳过
@@ -3180,7 +3204,9 @@ namespace TraeSign
         public static bool ShouldCheckinNow(DateTime now, DateTime? lastAttemptDate, DateTime? nextRetryAt, TimeSpan target)
         {
             if (lastAttemptDate == now.Date && nextRetryAt == null) return false;
-            if (nextRetryAt == null && now.TimeOfDay < target) return false;
+            // 目标时刻之前一律不触发（无论是否在退避中）：
+            // 避免退避时刻落在 target 之前就提前开跑，或把 target 跨过去
+            if (now.TimeOfDay < target) return false;
             if (nextRetryAt != null && now < nextRetryAt.Value) return false;
             return true;
         }
@@ -3548,7 +3574,7 @@ namespace TraeSign
                     : "每日 00:05 自动签到（" + (string.IsNullOrEmpty(acc.Username) ? acc.Brand : acc.Username) + "）");
             var retry = slot.Scheduler != null ? slot.Scheduler.NextRetryAt : null;
             _retryLabel.Text = isQd
-                ? (retry.HasValue ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm") : "每天 10:00 后自动领取 100 Credits")
+                ? (retry.HasValue ? "上次失败，下次重试：" + retry.Value.ToString("HH:mm") : "每天 10:05 自动领取 100 Credits（活动 10:00 刷新）")
                 : (isZc
                     ? "发现新套餐会自动领取并气泡通知"
                     : (retry.HasValue
@@ -3827,6 +3853,36 @@ namespace TraeSign
                 Check("今日已完成不触发", DailyScheduler.ShouldCheckinNow(d1, d1.Date, none, target) == false);
                 Check("退避中不触发", DailyScheduler.ShouldCheckinNow(d1, none, d1.AddMinutes(30), target) == false);
                 Check("退避结束触发", DailyScheduler.ShouldCheckinNow(d1.AddHours(1), none, d1.AddMinutes(30), target) == true);
+
+                // 2b. 退避不得跨过目标时刻（10-21 真机事故：凌晨退避拉满 120 分，
+                //     08:59 后下一次 10:59，把 Qoder 10:05 目标点整个跨过，晚领 55 分钟）
+                var qdTarget = DailyScheduler.QoderTarget;
+                var qdDay = new DateTime(2026, 10, 21);
+                // 目标时刻之前，即使在退避中也必须不触发
+                Check("QD 目标前不退避提前开跑",
+                    DailyScheduler.ShouldCheckinNow(qdDay.AddHours(9), none, qdDay.AddHours(9).AddMinutes(1), qdTarget) == false);
+                Check("QD 目标点触发", DailyScheduler.ShouldCheckinNow(qdDay.AddHours(10).AddMinutes(5), none, none, qdTarget) == true);
+                Check("QD 目标前 1 分钟不触发", DailyScheduler.ShouldCheckinNow(qdDay.AddHours(10).AddMinutes(4), none, none, qdTarget) == false);
+                // 退避时刻被设到目标之后：目标点仍不触发，但退避到期后要能触发
+                Check("QD 退避跨目标点时按退避等待",
+                    DailyScheduler.ShouldCheckinNow(qdDay.AddHours(10).AddMinutes(5), none, qdDay.AddHours(10).AddMinutes(59), qdTarget) == false);
+                Check("QD 退避到期后触发",
+                    DailyScheduler.ShouldCheckinNow(qdDay.AddHours(11), none, qdDay.AddHours(10).AddMinutes(59), qdTarget) == true);
+                // 2c. 目标时刻之前失败：不消耗退避计数、nextRetryAt 回到 null（10-21 事故根因）
+                DateTime? nr1;
+                int rc1;
+                DailyScheduler.NextRetryAfterFailure(qdDay.AddHours(1).AddMinutes(5), qdTarget, 4, out nr1, out rc1);
+                Check("QD 目标前失败不消耗退避", nr1 == null && rc1 == 4);
+                // 目标之后失败：正常退避且计数递增
+                DateTime? nr2;
+                int rc2;
+                DailyScheduler.NextRetryAfterFailure(qdDay.AddHours(10).AddMinutes(6), qdTarget, 0, out nr2, out rc2);
+                Check("QD 目标后失败正常退避", nr2.HasValue && nr2.Value == qdDay.AddHours(10).AddMinutes(11) && rc2 == 1);
+                // 退避不得跨过「目标+2h 宽限期」
+                DateTime? nr3;
+                int rc3;
+                DailyScheduler.NextRetryAfterFailure(qdDay.AddHours(11).AddMinutes(50), qdTarget, 4, out nr3, out rc3);
+                Check("QD 退避被宽限期截断", nr3.HasValue && nr3.Value == qdDay.AddHours(12).AddMinutes(5) && rc3 == 4);
 
                 // 3. 9095 停止判定
                 var r9095 = CheckinResult.Fail(9095, "x", "Trae CN");

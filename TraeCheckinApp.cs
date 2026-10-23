@@ -1959,8 +1959,97 @@ namespace TraeSign
     {
         public const string Platform = "ZCode";
         public const string BaseUrl = "https://zcode.z.ai/api/v1";
-        public const string AppVersion = "3.14.3";   // 与官方桌面端现行版一致；preview 按 app_version 过滤活动可见性
+        // 兜底版本（仅在读不到客户端真实版本时使用）。
+        // 注意：preview 的活动可见性按 app_version 过滤 —— 写死低版本会看不到新活动
+        // （2026-10-23 实测：3.14.3 看不到「ZCode 1024 Dev Day」，3.16.3/3.17.0 能看到）。
+        public const string DefaultAppVersion = "3.16.3";
         public const string EncPrefix = "enc:v1:";
+
+        private static string _appVersion;
+
+        // 动态读取本机 ZCode 客户端真实版本（如 3.16.3.8992 → 取前三段 3.16.3）
+        public static string AppVersion
+        {
+            get
+            {
+                if (!string.IsNullOrEmpty(_appVersion)) return _appVersion;
+                string v = DetectClientVersion();
+                _appVersion = string.IsNullOrEmpty(v) ? DefaultAppVersion : v;
+                return _appVersion;
+            }
+        }
+
+        // 供自测：重置缓存
+        public static void ResetVersionCache() { _appVersion = null; }
+
+        private static string DetectClientVersion()
+        {
+            // ① 已安装客户端的 exe 文件版本（最准，且能跟随客户端升级）
+            foreach (string exe in ClientExeCandidates())
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(exe) || !File.Exists(exe)) continue;
+                    var vi = System.Diagnostics.FileVersionInfo.GetVersionInfo(exe);
+                    string raw = vi.FileVersion ?? vi.ProductVersion;
+                    string v = NormalizeVersion(raw);
+                    if (!string.IsNullOrEmpty(v)) return v;
+                }
+                catch { }
+            }
+            // ② 运行中的 ZCode 进程
+            try
+            {
+                foreach (Process p in Process.GetProcessesByName("ZCode"))
+                {
+                    try
+                    {
+                        string ep = p.MainModule.FileName;
+                        var vi = System.Diagnostics.FileVersionInfo.GetVersionInfo(ep);
+                        string v = NormalizeVersion(vi.FileVersion ?? vi.ProductVersion);
+                        if (!string.IsNullOrEmpty(v)) return v;
+                    }
+                    catch { }
+                    finally { try { p.Dispose(); } catch { } }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static List<string> ClientExeCandidates()
+        {
+            var list = new List<string>();
+            try
+            {
+                string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                string pfx86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string[] dirs = new string[]
+                {
+                    Path.Combine(pf, "ZCode"),
+                    Path.Combine(pfx86, "ZCode"),
+                    Path.Combine(local, "Programs", "ZCode"),
+                    @"F:\Program Files\ZCode",   // 本机实测位置
+                    @"D:\Program Files\ZCode"
+                };
+                foreach (string d in dirs)
+                    if (!string.IsNullOrEmpty(d)) list.Add(Path.Combine(d, "ZCode.exe"));
+            }
+            catch { }
+            return list;
+        }
+
+        // "3.16.3.8992" → "3.16.3"；服务端只认三段版本号（实测四段会返回空活动）
+        internal static string NormalizeVersion(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return null;
+            string[] parts = raw.Trim().Split('.');
+            if (parts.Length < 3) return null;
+            int a, b, c;
+            if (!int.TryParse(parts[0], out a) || !int.TryParse(parts[1], out b) || !int.TryParse(parts[2], out c)) return null;
+            return a + "." + b + "." + c;
+        }
 
         // 自动检索：标准布局 ~/.zcode/v2/credentials.json 优先，再兜底若干历史/变体布局
         public static string CredentialsPath
@@ -2658,16 +2747,25 @@ namespace TraeSign
                     var entList = ents as System.Collections.ArrayList;
                     if (entList != null && entList.Count > 0)
                     {
-                        var e0 = entList[0] as Dictionary<string, object>;
-                        if (e0 != null)
+                        // 一个活动可含多个 entitlement（不同模型各自的额度），必须**全部累加**。
+                        // 2026-10-23 实测「ZCode 1024 Dev Day」= GLM-5.3-Flash 3 亿 + GLM-5.3 2 亿 = 5 亿，
+                        // 旧逻辑只取 entitlements[0] 会少报 2 亿。
+                        long total = 0;
+                        var names = new List<string>();
+                        foreach (object eo in entList)
                         {
+                            var e = eo as Dictionary<string, object>;
+                            if (e == null) continue;
                             object u;
-                            if (e0.TryGetValue("grant_units", out u) && u != null)
+                            if (e.TryGetValue("grant_units", out u) && u != null)
                             {
-                                try { plan.Units = Convert.ToInt64(u); } catch { }
+                                try { total += Convert.ToInt64(u); } catch { }
                             }
-                            plan.ShowName = JsonUtil.GetString(e0, "show_name");
+                            string sn = JsonUtil.GetString(e, "show_name");
+                            if (!string.IsNullOrEmpty(sn) && !names.Contains(sn)) names.Add(sn);
                         }
+                        plan.Units = total;
+                        plan.ShowName = names.Count == 0 ? null : string.Join(" + ", names.ToArray());
                     }
                 }
                 if (!string.IsNullOrEmpty(plan.PlanId)) list.Add(plan);
@@ -2687,16 +2785,17 @@ namespace TraeSign
             {
                 ReportActivation(deviceMid);   // 激活事件（best effort，疑似投放资格信号）
 
-                ApiResp pv = Preview(deviceMid, jwt);
-                if (pv == null)
-                    return CheckinResult.Fail(-3, "网络异常：ZCode 服务不可达", ZcodeAuth.Platform);
-                int code = JsonUtil.GetInt(JsonUtil.ParseJson(pv.Body), "code");
-                if (pv.Status == 401 || code == 401)
+                ApiResp pv;
+                int bizCode;
+                bool hadResponse;
+                List<ZcodePlan> plans = FetchPlans(deviceMid, jwt, out pv, out bizCode, out hadResponse);
+                if (bizCode == 401)
                     return CheckinResult.Fail(-6, "ZCode 登录已失效，请重新登录 ZCode 客户端", ZcodeAuth.Platform);
-                if (code != 0)
-                    return CheckinResult.Fail(code, "ZCode 服务返回错误(" + code + ")", ZcodeAuth.Platform);
+                if (!hadResponse)
+                    return CheckinResult.Fail(-3, "网络异常：ZCode 服务不可达", ZcodeAuth.Platform);
+                if (bizCode != 0)
+                    return CheckinResult.Fail(bizCode, "ZCode 服务返回错误(" + bizCode + ")", ZcodeAuth.Platform);
 
-                List<ZcodePlan> plans = ParsePreviewPlans(pv.Body);
                 ZcodePlan target = null;
                 foreach (var p in plans)
                     if (!ZcodeState.IsClaimed(p.PlanId)) { target = p; break; }
@@ -2868,11 +2967,63 @@ namespace TraeSign
             catch { }
         }
 
+        // 命中的 app_version 缓存：首次找到活动的版本优先复用（避免每次都多试几个版本）
+        private static string _workingAppVersion;
+
+        // preview 的活动可见性按 app_version 过滤，故探测多个候选版本：
+        // 客户端真实版本优先，再依次试更高的历史版本（活动常要求较新客户端才可见）
+        private static List<string> VersionCandidates()
+        {
+            var list = new List<string>();
+            if (!string.IsNullOrEmpty(_workingAppVersion)) list.Add(_workingAppVersion);
+            string cur = ZcodeAuth.AppVersion;
+            if (!list.Contains(cur)) list.Add(cur);
+            // 高版本兜底（本机实测 3.17.0 / 3.20.0 / 3.30.0 均能看到 1024 活动）
+            foreach (string v in new string[] { "3.30.0", "3.20.0", "3.17.0" })
+                if (!list.Contains(v)) list.Add(v);
+            return list;
+        }
+
         private static ApiResp Preview(string deviceMid, string jwt)
         {
+            return Preview(deviceMid, jwt, ZcodeAuth.AppVersion);
+        }
+
+        private static ApiResp Preview(string deviceMid, string jwt, string appVersion)
+        {
             string platform = Environment.Is64BitOperatingSystem ? "win32-x64" : "win32-x86";
-            string url = ZcodeAuth.BaseUrl + "/zcode-plan/billing/preview?app_version=" + ZcodeAuth.AppVersion + "&platform=" + platform;
+            string url = ZcodeAuth.BaseUrl + "/zcode-plan/billing/preview?app_version=" + appVersion + "&platform=" + platform;
             return HttpGetBilling(url, BuildHeaders(deviceMid, jwt));
+        }
+
+        // 按版本候选拉活动列表：返回首个能看到活动的版本结果。
+        // 区分三种情况，避免"网络失败"被误报成"暂无可领套餐"：
+        //   hadResponse=true  → 至少一次拿到业务响应（可判定"确实无活动"）
+        //   hadResponse=false → 全是网络异常（应报网络错误，不能当无事发生）
+        private static List<ZcodePlan> FetchPlans(string deviceMid, string jwt, out ApiResp lastResp, out int authCode, out bool hadResponse)
+        {
+            lastResp = null;
+            authCode = 0;
+            hadResponse = false;
+            var empty = new List<ZcodePlan>();
+            foreach (string ver in VersionCandidates())
+            {
+                ApiResp r = Preview(deviceMid, jwt, ver);
+                if (r == null || r.Status == 0) continue;          // 网络异常，换版本无意义但继续尝试
+                hadResponse = true;
+                lastResp = r;
+                int code = JsonUtil.GetInt(JsonUtil.ParseJson(r.Body), "code");
+                if (r.Status == 401 || code == 401) { authCode = 401; return empty; }
+                if (r.Status == 429) continue;                     // 限流，换版本或稍后重试
+                if (code != 0) { authCode = code; continue; }
+                var plans = ParsePreviewPlans(r.Body);
+                if (plans.Count > 0)
+                {
+                    _workingAppVersion = ver;
+                    return plans;
+                }
+            }
+            return empty;
         }
 
         private static ApiResp HttpGetBilling(string url, Dictionary<string, string> headers)
@@ -2909,11 +3060,12 @@ namespace TraeSign
             catch { return null; }
         }
 
-        private static string FormatUnits(long units)
+        // 额度显示：亿/万 单位（也供平台面板复用）
+        internal static string FormatUnits(long units)
         {
             if (units >= 100000000L && units % 100000000L == 0) return (units / 100000000L) + " 亿";
             if (units >= 10000L && units % 10000L == 0) return (units / 10000L) + " 万";
-            return units.ToString();
+            return units.ToString("N0");
         }
     }
 
@@ -3509,7 +3661,9 @@ namespace TraeSign
                 {
                     _todayStatusLabel.Text = todayWord + "：" + (isClaim ? "已领取" : "已签到");
                     if (isClaim)
-                        _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.HasValue ? entry.baseCredits.GetValueOrDefault(0).ToString("N0") : "--") + (isQd ? " Credits" : " token");
+                        _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.HasValue
+                            ? ZcodeRunner.FormatUnits(entry.baseCredits.GetValueOrDefault(0))
+                            : "--") + (isQd ? " Credits" : " token");
                     else if (entry.baseCredits.HasValue || entry.extra.HasValue)
                         _creditsLabel.Text = creditWord + "：+" + (entry.baseCredits.GetValueOrDefault(0) + entry.extra.GetValueOrDefault(0)) + "（基础" + entry.baseCredits + " 额外" + entry.extra + "）";
                     else
@@ -3965,6 +4119,24 @@ namespace TraeSign
                 Check("ZC preview 解析(ArrayList)", zplans.Count == 1 && zplans[0].PlanId == "p1" && zplans[0].Units == 100000000L && zplans[0].ShowName == "GLM-5.3-Flash");
                 Check("ZC 空 plans 解析", ZcodeRunner.ParsePreviewPlans("{\"code\":0,\"data\":{\"plans\":[]}}").Count == 0);
                 Check("ZC 非0 code 解析", ZcodeRunner.ParsePreviewPlans("{\"code\":401,\"msg\":\"x\"}").Count == 0);
+                // —— app_version 动态化（2026-10-23 事故：写死 3.14.3 看不到「1024 Dev Day」活动） ——
+                Check("ZC 版本归一化(四段→三段)", ZcodeAuth.NormalizeVersion("3.16.3.8992") == "3.16.3");
+                Check("ZC 版本归一化(三段保持)", ZcodeAuth.NormalizeVersion("3.17.0") == "3.17.0");
+                Check("ZC 版本归一化(非法返回null)",
+                    ZcodeAuth.NormalizeVersion("abc") == null && ZcodeAuth.NormalizeVersion("3.1") == null
+                    && ZcodeAuth.NormalizeVersion("") == null && ZcodeAuth.NormalizeVersion(null) == null);
+                Check("ZC AppVersion 为合法三段版本", ZcodeAuth.NormalizeVersion(ZcodeAuth.AppVersion) == ZcodeAuth.AppVersion);
+                // 多 entitlement 累加（2026-10-23 实测「1024 Dev Day」= 3 亿 + 2 亿 = 5 亿，不能只取第一条）
+                string multiEntJson = "{\"code\":0,\"data\":{\"plans\":[{\"plan_id\":\"p-1024\",\"name\":\"ZCode 1024 Dev Day\","
+                    + "\"entitlements\":[{\"show_name\":\"GLM-5.3-Flash\",\"grant_units\":300000000},"
+                    + "{\"show_name\":\"GLM-5.3\",\"grant_units\":200000000}]}]}}";
+                var zMulti = ZcodeRunner.ParsePreviewPlans(multiEntJson);
+                Check("ZC 多 entitlement 额度累加(3亿+2亿=5亿)", zMulti.Count == 1 && zMulti[0].Units == 500000000L);
+                Check("ZC 多 entitlement 模型名合并", zMulti.Count == 1 && zMulti[0].ShowName == "GLM-5.3-Flash + GLM-5.3");
+                // 已领套餐去重（用自测临时数据目录，不依赖真实 state）
+                ZcodeState.MarkClaimed("selftest-plan-1", "自测套餐", 100);
+                Check("ZC 已领套餐去重生效",
+                    ZcodeState.IsClaimed("selftest-plan-1") == true && ZcodeState.IsClaimed("not-exist-plan") == false);
                 Check("ZC Edge 路径探测", !string.IsNullOrEmpty(ZcodeCaptcha.FindEdgePath()));
                 string pageJson = "[{\"type\":\"page\",\"title\":\"TraeSign\",\"url\":\"file:///c.html\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9/devtools/page/ABC\"},{\"type\":\"service_worker\"}]";
                 Check("ZC json/list 页面解析(ArrayList)", ZcodeCaptcha.ParseJsonListToPageWs(pageJson) == "ws://127.0.0.1:9/devtools/page/ABC");

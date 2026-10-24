@@ -222,8 +222,6 @@ namespace TraeSign
 
         public NotifyIcon Tray { get { return _tray; } }
         public static TrayApp Instance { get { return _instance; } }
-        public IList<PlatformSlot> Slots { get { return _slots; } }
-
         public PlatformSlot Slot(string platform)
         {
             foreach (var s in _slots)
@@ -413,6 +411,8 @@ namespace TraeSign
             }
             if (_trae.ActiveBrand != null) _trae.Scheduler.ResetForBrand(_trae.ActiveBrand);
             if (_wb.ActiveBrand != null) _wb.Scheduler.ResetForBrand(_wb.ActiveBrand);
+            // Qoder 有每日调度器，同样要按"今日是否已完成"重置，保持四平台语义一致
+            if (_qd.ActiveBrand != null) _qd.Scheduler.ResetForBrand(_qd.ActiveBrand);
             // 各平台并行查询状态（只查询，不签到；ZCode 发现可领套餐会触发自动领取）
             RunCheckinAsync(true, "Trae", null);
             RunCheckinAsync(true, "WorkBuddy", null);
@@ -454,18 +454,35 @@ namespace TraeSign
                 {
                     CheckinResult r;
                     try { r = t.Result; }
-                    catch (Exception ex) { r = CheckinResult.Fail(-6, "调用签到程序异常: " + ex.Message, reqBrand); }
+                    catch (Exception ex)
+                    {
+                        // 引擎内部异常用独立错误码 -7，不能用 -6（那是"登录失效"专用）。
+                        // 否则任何 NullReference/解析崩溃都会被 UI 显示成"请重新登录"，
+                        // 把引擎 bug 误导向凭证排查，排障方向整条带偏。
+                        RuntimeLog.Write(slot.Platform + " engine-exception: " + ex);
+                        r = CheckinResult.Fail(-7, "程序内部异常: " + ex.Message, reqBrand);
+                    }
                     if (r != null) r.Platform = reqPlatform;
                     OnCheckinDone(slot, r, queryOnly, reqBrand);
                 }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
+        // 平台名 → 引擎的委托表：新增平台只需在此登记一行，不必再改分发 if-chain（review A-03）
+        internal static readonly Dictionary<string, Func<bool, string, CheckinResult>> PlatformRunners =
+            new Dictionary<string, Func<bool, string, CheckinResult>>
+            {
+                { WorkbuddyAuth.Platform, delegate(bool q, string b) { return WorkbuddyRunner.Run(q); } },
+                { ZcodeAuth.Platform, delegate(bool q, string b) { return ZcodeRunner.Run(q); } },
+                { QoderAuth.Platform, delegate(bool q, string b) { return QoderRunner.Run(q); } },
+                { CheckinRunner.Platform, delegate(bool q, string b) { return CheckinRunner.Run(q, b); } }
+            };
+
         private static CheckinResult RunPlatform(string platform, bool queryOnly, string brand)
         {
-            if (platform == WorkbuddyAuth.Platform) return WorkbuddyRunner.Run(queryOnly);
-            if (platform == ZcodeAuth.Platform) return ZcodeRunner.Run(queryOnly);
-            if (platform == QoderAuth.Platform) return QoderRunner.Run(queryOnly);
-            return CheckinRunner.Run(queryOnly, brand);
+            Func<bool, string, CheckinResult> runner;
+            if (platform != null && PlatformRunners.TryGetValue(platform, out runner) && runner != null)
+                return runner(queryOnly, brand);
+            return CheckinRunner.Run(queryOnly, brand);   // 兜底（理论上不可达）
         }
 
         private void OnCheckinDone(PlatformSlot slot, CheckinResult r, bool queryOnly, string requestedBrand)
@@ -692,6 +709,11 @@ namespace TraeSign
             return Encoding.UTF8.GetString(dec, 64, dec.Length - 64);
         }
 
+        // 预编译正则：静态 Regex.Match 每次都重新解析/编译模式（review B-10）
+        private static readonly System.Text.RegularExpressions.Regex DcIdPattern =
+            new System.Text.RegularExpressions.Regex("^iCubeAuthInfo://icube-dc:(\\d+)",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
+
         public static AuthData FindAuth(string brandFilter)
         {
             foreach (var a in FindAllAuths())
@@ -745,7 +767,7 @@ namespace TraeSign
                 string dcId = "";
                 foreach (string k in s.Keys)
                 {
-                    var m = System.Text.RegularExpressions.Regex.Match(k, "^iCubeAuthInfo://icube-dc:(\\d+)");
+                    var m = DcIdPattern.Match(k);
                     if (m.Success) { dcId = m.Groups[1].Value; break; }
                 }
                 string enc = null;
@@ -883,6 +905,9 @@ namespace TraeSign
 
     internal static class CheckinRunner
     {
+        // 平台标识常量（原先只有字面量 "Trae" 散布各处）
+        public const string Platform = "Trae";
+
         public static CheckinResult Run(bool queryOnly, string brand)
         {
             AuthData auth = TraeAuth.FindAuth(brand);
@@ -1088,6 +1113,46 @@ namespace TraeSign
         }
     }
 
+    // ============ 通用工具（编码 / DPAPI）============
+    // 去重：Base64UrlDecode 原本在 WorkBuddy 与 ZCode 各有一份逐字符相同的实现，
+    // DPAPI 在 WorkBuddy 与 Qoder 各有一份。集中一处，避免改一处漏一处（review B-05/B-06）。
+    internal static class InternalUtil
+    {
+        public static string Base64UrlDecode(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            string t = s.Replace('-', '+').Replace('_', '/');
+            int pad = (4 - t.Length % 4) % 4;
+            if (pad > 0) t = t + new string('=', pad);
+            return Encoding.UTF8.GetString(Convert.FromBase64String(t));
+        }
+
+        public static string Base64UrlEncode(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(s)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        // DPAPI（CurrentUser）：绑定当前 Windows 用户，换用户/换机无法解密
+        public static string DpapiProtect(string plain)
+        {
+            byte[] enc = System.Security.Cryptography.ProtectedData.Protect(
+                Encoding.UTF8.GetBytes(plain ?? ""), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(enc);
+        }
+
+        public static string DpapiUnprotect(string b64)
+        {
+            try
+            {
+                byte[] dec = System.Security.Cryptography.ProtectedData.Unprotect(
+                    Convert.FromBase64String(b64 ?? ""), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(dec);
+            }
+            catch { return null; }
+        }
+    }
+
     // ============ WorkBuddy 凭证（客户端文件明文兼容 + OAuth 插件授权流 + DPAPI token 库） ============
     internal class WbAuthData
     {
@@ -1265,20 +1330,10 @@ namespace TraeSign
             catch { return null; }
         }
 
-        public static string Base64UrlDecode(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            string t = s.Replace('-', '+').Replace('_', '/');
-            int pad = (4 - t.Length % 4) % 4;
-            if (pad > 0) t = t + new string('=', pad);
-            return Encoding.UTF8.GetString(Convert.FromBase64String(t));
-        }
+        // 编码实现集中在 InternalUtil（原与 ZCode 各一份逐字符相同的实现）
+        public static string Base64UrlDecode(string s) { return InternalUtil.Base64UrlDecode(s); }
 
-        public static string Base64UrlEncode(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return Convert.ToBase64String(Encoding.UTF8.GetBytes(s)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-        }
+        public static string Base64UrlEncode(string s) { return InternalUtil.Base64UrlEncode(s); }
 
         public static bool IsExpired(long expiresAtMs)
         {
@@ -1341,31 +1396,21 @@ namespace TraeSign
             catch { }
         }
 
-        private static string DpapiProtect(string plain)
-        {
-            byte[] enc = System.Security.Cryptography.ProtectedData.Protect(
-                Encoding.UTF8.GetBytes(plain ?? ""), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
-            return Convert.ToBase64String(enc);
-        }
+        // DPAPI 实现集中在 InternalUtil（原与 Qoder 各一份）
+        private static string DpapiProtect(string plain) { return InternalUtil.DpapiProtect(plain); }
 
-        private static string DpapiUnprotect(string b64)
-        {
-            try
-            {
-                byte[] dec = System.Security.Cryptography.ProtectedData.Unprotect(
-                    Convert.FromBase64String(b64 ?? ""), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
-                return Encoding.UTF8.GetString(dec);
-            }
-            catch { return null; }
-        }
+        private static string DpapiUnprotect(string b64) { return InternalUtil.DpapiUnprotect(b64); }
 
         // ---------- 取可用 token：客户端明文 → token 库（过期自动续期） ----------
         public static WbAuthData GetWorkingToken()
         {
-            WbAuthData file = ReadClientFile();
-            if (file != null && !string.IsNullOrEmpty(file.AccessToken) && !IsExpired(file.ExpiresAt)) return file;
+            return PickWorkingToken(ReadClientFile(), LoadStore());
+        }
 
-            WbAuthData store = LoadStore();
+        // 从已读到的客户端文件与 token 库中择优（避免重复读盘/重复解密）
+        private static WbAuthData PickWorkingToken(WbAuthData file, WbAuthData store)
+        {
+            if (file != null && !string.IsNullOrEmpty(file.AccessToken) && !IsExpired(file.ExpiresAt)) return file;
             if (store != null && !string.IsNullOrEmpty(store.AccessToken))
             {
                 if (!IsExpired(store.ExpiresAt)) return store;
@@ -1479,13 +1524,16 @@ namespace TraeSign
         public static List<AccountInfo> ListAccounts()
         {
             var list = new List<AccountInfo>();
+            // 只读一次客户端文件与 token 库：原实现先各读一次，再由 GetWorkingToken 内部
+            // 重复读一遍（含递归目录扫描 + DPAPI 解密，过期时还会触发续期网络请求）——review D-2
             WbAuthData file = ReadClientFile();
             WbAuthData store = LoadStore();
+            WbAuthData working = PickWorkingToken(file, store);
             string uid = null;
             long exp = 0;
             if (file != null && !string.IsNullOrEmpty(file.Uid)) { uid = file.Uid; exp = file.ExpiresAt; }
             if (uid == null && store != null && !string.IsNullOrEmpty(store.Uid)) { uid = store.Uid; exp = store.ExpiresAt; }
-            bool hasToken = GetWorkingToken() != null;
+            bool hasToken = working != null;
             if (uid == null && !hasToken) return list;
             var info = new AccountInfo();
             info.Brand = Platform;
@@ -1709,12 +1757,12 @@ namespace TraeSign
         public static string BuildAgentPrompt()
         {
             var sb = new StringBuilder();
-            sb.AppendLine("请在这台 Windows 电脑上检查并补齐 TraeSign.exe（三平台自动签到托盘程序）的运行环境：");
+            sb.AppendLine("请在这台 Windows 电脑上检查并补齐 TraeSign.exe（四平台自动签到托盘程序）的运行环境：");
             sb.AppendLine("1. 检测 .NET Framework 4.8 运行时：读注册表 HKLM\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Full 的 Release 值，>= 528040 即满足。若不满足，安装 .NET Framework 4.8 运行时（引导用户到 https://dotnet.microsoft.com/download/dotnet-framework/net48 下载 Runtime 安装，装完重启一次）；");
             sb.AppendLine("2. 检测 Microsoft Edge 浏览器：确认 C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe 或 C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe 存在。若缺失，用 winget install Microsoft.Edge 或引导用户到官网安装；");
             sb.AppendLine("3. 检查杀毒软件误报：TraeSign.exe 为本机 csc 编译、无数字签名，可能被 Defender 或安全管家误报，请协助加入信任/白名单；");
             sb.AppendLine("4. 无需安装 Node.js、Python 或其他任何运行时，也无任何配置文件依赖；");
-            sb.AppendLine("5. 完成后双击运行 TraeSign.exe 验证：应最小化到系统托盘（任务栏右下角），托盘图标显示状态，双击托盘图标可打开主窗口（Trae / WorkBuddy / ZCode 三个页签）。");
+            sb.AppendLine("5. 完成后双击运行 TraeSign.exe 验证：应最小化到系统托盘（任务栏右下角），托盘图标显示状态，双击托盘图标可打开主窗口（Trae / WorkBuddy / ZCode / Qoder 四个页签）。");
             return sb.ToString();
         }
     }
@@ -1753,6 +1801,7 @@ namespace TraeSign
                 "   Trae：本机装有 Trae 客户端并登录，自动读取登录态\r\n" +
                 "   WorkBuddy：无需客户端，在 WorkBuddy 页签点一次“登录授权”即可\r\n" +
                 "   ZCode：本机装有 ZCode 客户端/CLI 并登录，自动读取登录态\r\n" +
+                "   Qoder：本机装有 Qoder CN 客户端并登录，自动读取登录态（之后无需再开客户端）\r\n" +
                 "\r\n" +
                 "无需安装 Node.js、Python 或其他任何运行时；无配置文件依赖。\r\n" +
                 "缺少某平台客户端不影响其他平台正常签到。\r\n" +
@@ -1979,9 +2028,6 @@ namespace TraeSign
             }
         }
 
-        // 供自测：重置缓存
-        public static void ResetVersionCache() { _appVersion = null; }
-
         private static string DetectClientVersion()
         {
             // ① 已安装客户端的 exe 文件版本（最准，且能跟随客户端升级）
@@ -2052,32 +2098,44 @@ namespace TraeSign
         }
 
         // 自动检索：标准布局 ~/.zcode/v2/credentials.json 优先，再兜底若干历史/变体布局
+        // 路径缓存：getter 内含多路径 File.Exists + 目录枚举 + 递归探测，
+        // 而 GetJwt 每次调用会访问两次（Exists + ReadAllText），10 分钟一轮轮询纯浪费（review B-09）。
+        // 路径在进程内不会变（除非用户中途迁移数据目录，此时重启程序即可）。
+        private static string _credentialsPath;
+
         public static string CredentialsPath
         {
             get
             {
-                try
-                {
-                    string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                    string[] candidates = new string[]
-                    {
-                        Path.Combine(home, ".zcode", "v2", "credentials.json"),   // 现行标准
-                        Path.Combine(home, ".zcode", "credentials.json"),
-                        Path.Combine(home, ".zcode", "v1", "credentials.json"),
-                        Path.Combine(home, ".z-ai", "credentials.json")
-                    };
-                    foreach (string p in candidates)
-                        if (File.Exists(p)) return p;
-                    // 自动检索：~ 下任意 .zcode* 目录里深度 ≤3 的 credentials.json
-                    foreach (string dir in Directory.GetDirectories(home, ".zcode*"))
-                    {
-                        string found = FindCredFile(dir, 0);
-                        if (found != null) return found;
-                    }
-                    return candidates[0];
-                }
-                catch { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "v2", "credentials.json"); }
+                if (!string.IsNullOrEmpty(_credentialsPath)) return _credentialsPath;
+                _credentialsPath = ResolveCredentialsPath();
+                return _credentialsPath;
             }
+        }
+
+        private static string ResolveCredentialsPath()
+        {
+            try
+            {
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string[] candidates = new string[]
+                {
+                    Path.Combine(home, ".zcode", "v2", "credentials.json"),   // 现行标准
+                    Path.Combine(home, ".zcode", "credentials.json"),
+                    Path.Combine(home, ".zcode", "v1", "credentials.json"),
+                    Path.Combine(home, ".z-ai", "credentials.json")
+                };
+                foreach (string p in candidates)
+                    if (File.Exists(p)) return p;
+                // 自动检索：~ 下任意 .zcode* 目录里深度 ≤3 的 credentials.json
+                foreach (string dir in Directory.GetDirectories(home, ".zcode*"))
+                {
+                    string found = FindCredFile(dir, 0);
+                    if (found != null) return found;
+                }
+                return candidates[0];
+            }
+            catch { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "v2", "credentials.json"); }
         }
 
         private static string FindCredFile(string dir, int depth)
@@ -2146,14 +2204,8 @@ namespace TraeSign
             catch { return null; }
         }
 
-        public static string Base64UrlDecode(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            string t = s.Replace('-', '+').Replace('_', '/');
-            int pad = (4 - t.Length % 4) % 4;
-            if (pad > 0) t = t + new string('=', pad);
-            return Encoding.UTF8.GetString(Convert.FromBase64String(t));
-        }
+        // 与 WorkBuddy 共用的编码实现，统一走 InternalUtil（review B-05）
+        public static string Base64UrlDecode(string s) { return InternalUtil.Base64UrlDecode(s); }
 
         // 取 JWT（解密失败/未登录返回 null）；JWT 仅在内存使用
         public static string GetJwt()
@@ -2267,7 +2319,13 @@ namespace TraeSign
         public static bool IsClaimed(string planId)
         {
             if (string.IsNullOrEmpty(planId)) return false;
-            var st = Load();
+            return IsClaimed(Load(), planId);
+        }
+
+        // 重载：接受已加载的 state，避免在循环里逐条重复读文件（review B-08）
+        public static bool IsClaimed(ZcodeStateDto st, string planId)
+        {
+            if (st == null || string.IsNullOrEmpty(planId)) return false;
             foreach (var c in st.claimed)
                 if (c != null && c.plan_id == planId) return true;
             return false;
@@ -2408,6 +2466,8 @@ namespace TraeSign
             finally
             {
                 try { if (proc != null && !proc.HasExited) Process.Start("taskkill", "/PID " + proc.Id + " /T /F"); } catch { }
+                // 释放 Process 句柄（重试分支会覆盖 proc，旧实例否则泄漏——review B-15）
+                try { if (proc != null) proc.Dispose(); } catch { }
             }
         }
 
@@ -2512,15 +2572,6 @@ namespace TraeSign
         private static string JsonQuote(string s)
         {
             return new JavaScriptSerializer().Serialize(s ?? "");
-        }
-
-        private static int GetFreePort()
-        {
-            var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
-            l.Start();
-            int port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
-            l.Stop();
-            return port;
         }
 
         private static ApiResp HttpGetLocal(string url)
@@ -2797,8 +2848,9 @@ namespace TraeSign
                     return CheckinResult.Fail(bizCode, "ZCode 服务返回错误(" + bizCode + ")", ZcodeAuth.Platform);
 
                 ZcodePlan target = null;
+                ZcodeStateDto state = ZcodeState.Load();   // 只读一次，循环内不重复读文件
                 foreach (var p in plans)
-                    if (!ZcodeState.IsClaimed(p.PlanId)) { target = p; break; }
+                    if (!ZcodeState.IsClaimed(state, p.PlanId)) { target = p; break; }
 
                 if (queryOnly)
                 {
@@ -2930,7 +2982,7 @@ namespace TraeSign
             h["User-Agent"] = "ZCode/" + ZcodeAuth.AppVersion;
             h["X-Title"] = "Z Code@electron";
             h["X-ZCode-App-Version"] = ZcodeAuth.AppVersion;
-            h["X-Platform"] = "win32-x64";
+            h["X-Platform"] = ZcodeRunner.PlatformTag;   // 与 preview 的 platform 参数统一取值，避免头/参数自相矛盾
             h["X-Release-Channel"] = "stable";
             h["X-Client-Language"] = "zh-CN";
             h["X-Client-Timezone"] = "Asia/Shanghai";
@@ -2942,10 +2994,24 @@ namespace TraeSign
             return h;
         }
 
+        // 激活事件按天去重：app_launch / app_daily_active 语义上每天只需一次。
+        // 原实现在 Run() 开头无条件上报，而 ZCode 每 10 分钟轮询一次 → 约 144 次/天无用 POST，
+        // 高频重复上报本身也可能是风控负信号（review B-01）。
+        private static DateTime _lastActivationDateUtc = DateTime.MinValue;
+
+        internal static bool ShouldReportActivation(DateTime nowDate, DateTime lastDate)
+        {
+            return lastDate.Date != nowDate.Date;
+        }
+
         private static void ReportActivation(string deviceMid)
         {
             try
             {
+                DateTime today = DateTime.UtcNow.Date;
+                if (!ShouldReportActivation(today, _lastActivationDateUtc)) return;
+                _lastActivationDateUtc = today;
+
                 long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 var body = new Dictionary<string, object>();
                 var events = new List<object>();
@@ -2984,16 +3050,32 @@ namespace TraeSign
             return list;
         }
 
-        private static ApiResp Preview(string deviceMid, string jwt)
-        {
-            return Preview(deviceMid, jwt, ZcodeAuth.AppVersion);
-        }
-
         private static ApiResp Preview(string deviceMid, string jwt, string appVersion)
         {
-            string platform = Environment.Is64BitOperatingSystem ? "win32-x64" : "win32-x86";
+            string platform = PlatformTag;
             string url = ZcodeAuth.BaseUrl + "/zcode-plan/billing/preview?app_version=" + appVersion + "&platform=" + platform;
             return HttpGetBilling(url, BuildHeaders(deviceMid, jwt));
+        }
+
+        // 32/64 位平台标识统一入口：请求头与 URL 参数必须一致（原实现头里硬编码 x64、
+        // 参数按操作系统判断，32 位系统下自相矛盾——review B-17）
+        internal static string PlatformTag
+        {
+            get { return Environment.Is64BitOperatingSystem ? "win32-x64" : "win32-x86"; }
+        }
+
+        // 全版本扫描节流：无活动是 99% 的稳态，若每轮（10 分钟）都把 [当前版本+3.30.0+3.20.0+3.17.0]
+        // 全部请求一遍，就是 4-5 次/轮 ≈ 600-720 次/天的纯空转（review D 实测指出）。
+        // 策略：稳态只探"当前/已命中版本"（1 次）；每 FullSweepInterval 才做一次全版本兜底扫描，
+        // 既保留 pitfalls #61 的高版本兜底语义，又把常态请求量降到约 1/4。
+        private static DateTime _lastFullSweepUtc = DateTime.MinValue;
+        internal static readonly TimeSpan FullSweepInterval = TimeSpan.FromMinutes(30);
+
+        // 供自测/诊断：当前是否处于"该做全版本扫描"的时机
+        internal static bool ShouldFullSweep(DateTime nowUtc, DateTime lastSweepUtc, TimeSpan interval)
+        {
+            if (lastSweepUtc == DateTime.MinValue) return true;
+            return (nowUtc - lastSweepUtc) >= interval;
         }
 
         // 按版本候选拉活动列表：返回首个能看到活动的版本结果。
@@ -3006,7 +3088,23 @@ namespace TraeSign
             authCode = 0;
             hadResponse = false;
             var empty = new List<ZcodePlan>();
-            foreach (string ver in VersionCandidates())
+
+            bool fullSweep = ShouldFullSweep(DateTime.UtcNow, _lastFullSweepUtc, FullSweepInterval);
+            List<string> versions;
+            if (fullSweep)
+            {
+                versions = VersionCandidates();
+            }
+            else
+            {
+                // 稳态快速探测：已命中版本 + 当前客户端版本（各 1 次，去重）
+                versions = new List<string>();
+                if (!string.IsNullOrEmpty(_workingAppVersion)) versions.Add(_workingAppVersion);
+                string cur = ZcodeAuth.AppVersion;
+                if (!versions.Contains(cur)) versions.Add(cur);
+            }
+
+            foreach (string ver in versions)
             {
                 ApiResp r = Preview(deviceMid, jwt, ver);
                 if (r == null || r.Status == 0) continue;          // 网络异常，换版本无意义但继续尝试
@@ -3023,6 +3121,8 @@ namespace TraeSign
                     return plans;
                 }
             }
+            // 全版本扫完仍无活动：记录时间，抑制后续若干轮的重复全扫
+            if (fullSweep && hadResponse) _lastFullSweepUtc = DateTime.UtcNow;
             return empty;
         }
 
@@ -3155,18 +3255,6 @@ namespace TraeSign
             }
         }
 
-        public static string GetUser(string brand)
-        {
-            try
-            {
-                var data = LoadMigrated();
-                string u;
-                if (data.users.TryGetValue(brand, out u)) return u;
-            }
-            catch { }
-            return null;
-        }
-
         public static void SetUser(string brand, string username)
         {
             if (string.IsNullOrEmpty(brand) || string.IsNullOrEmpty(username)) return;
@@ -3208,9 +3296,11 @@ namespace TraeSign
             return map;
         }
 
+        // 今日是否真的签到成功（注意：不能用"有今日条目"代替——失败也会写条目）
         public static bool TodaySuccess(string brand)
         {
-            return TodayEntry(brand) != null;
+            HistoryEntry e = TodayEntry(brand);
+            return e != null && e.success;
         }
 
         public static HistoryEntry TodayEntry(string brand)
@@ -3225,6 +3315,16 @@ namespace TraeSign
         public static bool BrandHasTodayAttempt(string brand)
         {
             return TodayEntry(brand) != null;
+        }
+
+        // 今日是否"不必再尝试"：成功 或 本机已被另一账号占用(9095)。
+        // 失败（网络异常/内部异常）不算，必须允许继续重试——否则一次失败后
+        // 进程重启会让当天彻底停摆（review A-04 实测缺陷）。
+        public static bool TodayDone(string brand)
+        {
+            HistoryEntry e = TodayEntry(brand);
+            if (e == null) return false;
+            return e.success || e.occupied;
         }
 
         private static void Save(HistoryData data)
@@ -3335,21 +3435,16 @@ namespace TraeSign
             _retryCount = newCount;
         }
 
-        // 切换账号时重置：新账号今日未尝试→立即补签；已尝试→按记录跳过
+        // 切换账号/进程重启时重置调度状态。
+        // 只有"今日确实完成"（成功 或 被占用）才当天停摆；失败必须保留重试机会。
+        // 原实现用 BrandHasTodayAttempt（有任何条目即算），导致一次网络失败后
+        // 进程重启就当天不再尝试（review A-04 实测缺陷）。
         public void ResetForBrand(string brand)
         {
-            if (HistoryStore.BrandHasTodayAttempt(brand))
-            {
-                _lastAttemptDate = DateTime.Now.Date;
-                _nextRetryAt = null;
-                _retryCount = 0;
-            }
-            else
-            {
-                _lastAttemptDate = null;
-                _nextRetryAt = null;
-                _retryCount = 0;
-            }
+            _lastAttemptDate = HistoryStore.TodayDone(brand) ? DateTime.Now.Date : (DateTime?)null;
+            _nextRetryAt = null;
+            _retryCount = 0;
+            // 今日已完成但当前已过目标时刻：保持停摆；未完成则回到"等目标时刻"状态
         }
 
         // 纯逻辑（供测试）: now 时刻是否应该触发签到
@@ -3912,7 +4007,7 @@ namespace TraeSign
                 _titleStatus.Text = "状态：进行中";
                 _titleStatus.ForeColor = Color.Gray;
             }
-            _titleStatus.Tag = tip;
+            // tip 已用于托盘提示，无需存到 Tag（原写法写入后无任何读取点）
             _traePanel.RefreshView();
             _wbPanel.RefreshView();
             _zcPanel.RefreshView();
@@ -4043,6 +4138,27 @@ namespace TraeSign
                 var r9074 = CheckinResult.Fail(9074, "x", "Trae CN");
                 Check("9095 当天停止", DailyScheduler.ShouldStopToday(r9095) == true);
                 Check("9074 继续重试", DailyScheduler.ShouldStopToday(r9074) == false);
+
+                // 3b. 本轮优化新增的纯逻辑（review 采纳项，防止回归）
+                DateTime actToday = new DateTime(2026, 10, 24);
+                Check("激活事件同日不重复上报", ZcodeRunner.ShouldReportActivation(actToday, actToday) == false);
+                Check("激活事件跨天需上报", ZcodeRunner.ShouldReportActivation(actToday, actToday.AddDays(-1)) == true);
+                Check("激活事件首次上报", ZcodeRunner.ShouldReportActivation(actToday, DateTime.MinValue) == true);
+                // 版本全扫节流：首次必扫、间隔内不扫、超interval扫描
+                Check("版本全扫首次生效", ZcodeRunner.ShouldFullSweep(actToday, DateTime.MinValue, ZcodeRunner.FullSweepInterval) == true);
+                Check("版本全扫间隔内跳过",
+                    ZcodeRunner.ShouldFullSweep(actToday.AddMinutes(10), actToday, ZcodeRunner.FullSweepInterval) == false);
+                Check("版本全扫超间隔执行",
+                    ZcodeRunner.ShouldFullSweep(actToday.AddMinutes(31), actToday, ZcodeRunner.FullSweepInterval) == true);
+                // TodayDone 语义：失败不算"今日已完成"（A-04 停摆缺陷的回归防线）
+                string tBrand = "SelfTestBrand";
+                HistoryStore.Upsert(new HistoryEntry { brand = tBrand, date = DateTime.Now.ToString("yyyy-MM-dd"), success = false, code = -3, ts = 1 });
+                Check("失败记录不算今日已完成", HistoryStore.TodayDone(tBrand) == false);
+                Check("失败记录下 TodaySuccess 为假", HistoryStore.TodaySuccess(tBrand) == false);
+                HistoryStore.Upsert(new HistoryEntry { brand = tBrand, date = DateTime.Now.ToString("yyyy-MM-dd"), success = true, ts = 2 });
+                Check("成功记录才算今日已完成", HistoryStore.TodayDone(tBrand) == true && HistoryStore.TodaySuccess(tBrand) == true);
+                // 平台委托表覆盖四平台（A-03 回归防线）
+                Check("平台委托表含四平台", TrayApp.PlatformRunners.Count == 4);
 
                 // 4. 真实账号列表 + 解密一致性
                 var accounts = CheckinRunner.ListAccounts();
@@ -4280,3 +4396,4 @@ namespace TraeSign
         }
     }
 }
+

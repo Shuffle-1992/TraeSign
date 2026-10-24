@@ -288,7 +288,20 @@ namespace TraeSign
             return null;
         }
 
+        // 客户端版本缓存：FindInstallDir 要走注册表卸载项枚举（数百子键）+ 全盘目录探测，
+        // 每次 BuildHeaders 都调一次会让一次签到流程做 2-4 次完整探测（review B-02）。
+        // 版本在进程生命周期内不变，缓存即可（对齐 MachineId 的既有做法）。
+        private static string _clientVersion;
+
         public static string ClientVersion()
+        {
+            if (!string.IsNullOrEmpty(_clientVersion)) return _clientVersion;
+            string v = DetectClientVersion();
+            _clientVersion = string.IsNullOrEmpty(v) ? DefaultClientVersion : v;
+            return _clientVersion;
+        }
+
+        private static string DetectClientVersion()
         {
             try
             {
@@ -547,21 +560,10 @@ namespace TraeSign
             return null;
         }
 
-        private static string DpapiProtect(string plain)
-        {
-            byte[] enc = ProtectedData.Protect(Encoding.UTF8.GetBytes(plain ?? ""), null, DataProtectionScope.CurrentUser);
-            return Convert.ToBase64String(enc);
-        }
+        // DPAPI 实现集中在 InternalUtil（原与 WorkBuddy 各一份）
+        private static string DpapiProtect(string plain) { return InternalUtil.DpapiProtect(plain); }
 
-        private static string DpapiUnprotect(string b64)
-        {
-            try
-            {
-                byte[] dec = ProtectedData.Unprotect(Convert.FromBase64String(b64 ?? ""), null, DataProtectionScope.CurrentUser);
-                return Encoding.UTF8.GetString(dec);
-            }
-            catch { return null; }
-        }
+        private static string DpapiUnprotect(string b64) { return InternalUtil.DpapiUnprotect(b64); }
     }
 
     // ============ Qoder UMID 风控三件套（Cosy-Machine*） ============
